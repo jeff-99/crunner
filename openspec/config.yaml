@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  crunner is a small, in-process Go task scheduler library (module github.com/jeff-99/crunner),
+  extracted from the datahub-engine project to be open-sourced.
+  Its distinguishing feature is Airflow-style trigger windows: every run receives the time window
+  it covers, with backfill of past windows and skipping of runs that start too late (MaxDrift).
+  Goal: harden it and close the most relevant gaps with go-co-op/gocron v2, while keeping the
+  window semantics. Prefer the standard library; avoid new third-party dependencies.
+  Changes are intentionally small and self-contained so they can be reviewed and implemented one
+  at a time, each on its own branch. Breaking API changes are acceptable before v1.0.0, but each
+  change must state them explicitly.
+
+rules:
+  proposal:
+    - State any breaking API change explicitly in Impact
+    - List which other proposed changes this one depends on, if any
+  tasks:
+    - Every behaviour change needs a test task; use testing/synctest for time-dependent tests
