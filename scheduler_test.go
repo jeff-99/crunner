@@ -863,3 +863,106 @@ func TestOverwriteTaskCancelCallback(t *testing.T) {
 		scheduler.Stop()
 	})
 }
+
+// lateOnceSchedule returns a trigger time in the past on its first call, so the
+// first run is always late, and a far-future time afterwards.
+type lateOnceSchedule struct {
+	calls atomic.Int32
+}
+
+func (l *lateOnceSchedule) Next(ctx context.Context, schedulingStart time.Time, lastRun *time.Time) (time.Time, error) {
+	if l.calls.Add(1) == 1 {
+		return time.Now().Add(-time.Hour), nil
+	}
+	return time.Now().Add(24 * time.Hour), nil
+}
+
+func TestMassDriftSkipDoesNotStallScheduler(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		const lateTasks = 300
+
+		var cancelled atomic.Int32
+		var canaryRuns atomic.Int32
+		schedules := make([]*lateOnceSchedule, lateTasks)
+
+		for i := range lateTasks {
+			schedules[i] = &lateOnceSchedule{}
+			err := scheduler.RegisterTask(
+				func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+				schedules[i],
+				s.WithID(fmt.Sprintf("late-%d", i)),
+				s.WithMaxDrift(time.Second),
+				s.WithCancelCallback(func(ctx context.Context) { cancelled.Add(1) }),
+			)
+			assert.NoError(t, err)
+		}
+		err := scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { canaryRuns.Add(1); return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("canary"),
+		)
+		assert.NoError(t, err)
+
+		scheduler.Start(t.Context())
+		tickXSeconds(5 * time.Second)
+
+		assert.Equal(t, int32(lateTasks), cancelled.Load(), "every late task should be skipped")
+		for i, sch := range schedules {
+			assert.Equal(t, int32(2), sch.calls.Load(), "late task %d should be rescheduled once", i)
+		}
+		assert.Equal(t, int32(5), canaryRuns.Load(), "canary task should keep running")
+
+		scheduler.Stop()
+	})
+}
+
+func TestBlockingDriftSkipCallbackDoesNotBlockOtherTasks(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var canaryRuns atomic.Int32
+		sch := &lateOnceSchedule{}
+		release := make(chan struct{})
+		callbackReturned := make(chan struct{})
+
+		scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			sch,
+			s.WithID("late"),
+			s.WithMaxDrift(time.Second),
+			s.WithCancelCallback(func(ctx context.Context) {
+				<-release
+				close(callbackReturned)
+			}),
+		)
+		scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { canaryRuns.Add(1); return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("canary"),
+		)
+
+		scheduler.Start(t.Context())
+		tickXSeconds(3 * time.Second)
+
+		assert.Equal(t, int32(3), canaryRuns.Load(), "other tasks keep running while the callback blocks")
+		assert.Equal(t, int32(2), sch.calls.Load(), "skipped task is rescheduled while the callback blocks")
+
+		stopped := make(chan struct{})
+		go func() {
+			scheduler.Stop()
+			close(stopped)
+		}()
+		synctest.Wait()
+		select {
+		case <-stopped:
+			t.Fatal("Stop returned while the skip callback was still running")
+		default:
+		}
+
+		close(release)
+		<-callbackReturned
+		<-stopped
+	})
+}

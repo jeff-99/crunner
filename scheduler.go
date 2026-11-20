@@ -407,15 +407,16 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 
 		if su.onCancel != nil {
 			f := *su.onCancel
-			f(ctx)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer cancel()
+				f(ctx)
+			}()
+		} else {
+			cancel()
 		}
-		select {
-		case <-s.schedulerCtx.Done():
-			s.logger.Trace().Str("task", su.ID()).Msg("Scheduler context done, not rescheduling skipped task.")
-		case s.newTaskCh <- su:
-			s.logger.Trace().Str("task", su.ID()).Msg("Skipped task sent for rescheduling.")
-		}
-		cancel()
+		s.scheduleTask(su)
 		return
 	}
 
