@@ -1,7 +1,7 @@
 ## 1. Reproduce
 
-- [ ] 1.1 Add a stress test that concurrently registers, replaces and removes tasks and calls Stop while short tasks run with a tiny summary interval; verify it reports a data race with `go test -race -run Stress` on current main
-- [ ] 1.2 Fix the data races in the existing test helpers (`TestTriggerMetadataInTask`, `TestTaskTriggerWindows`, `TestTaskTriggerWindowsWithBackfill`: metadata recorded by the task goroutine and read by the test body without synchronisation) using atomics or a mutex; verify these tests report no races that originate in test code
+- [x] 1.1 Add a stress test that concurrently registers, replaces and removes tasks and calls Stop while short tasks run with a tiny summary interval; verify it reports a data race with `go test -race -run Stress` on current main
+- [x] 1.2 Fix the data races in the existing test helpers (`TestTriggerMetadataInTask`, `TestTaskTriggerWindows`, `TestTaskTriggerWindowsWithBackfill`: metadata recorded by the task goroutine and read by the test body without synchronisation) using atomics or a mutex; verify these tests report no races that originate in test code
 
 ## 2. Main loop owns run results
 
