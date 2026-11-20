@@ -982,9 +982,17 @@ func TestBlockingDriftSkipCallbackDoesNotBlockOtherTasks(t *testing.T) {
 
 func TestStressConcurrentRegisterReplaceRemoveStop(t *testing.T) {
 	scheduler := s.New(s.WithSummaryInterval(time.Millisecond))
-	var runs atomic.Int64
-
 	assert.NoError(t, scheduler.Start(t.Context()))
+
+	var stableRuns atomic.Int64
+	assert.NoError(t, scheduler.RegisterTask(
+		func(ctx context.Context, meta s.TriggerMetadata) error {
+			stableRuns.Add(1)
+			return nil
+		},
+		s.WithIntervalSchedule(time.Millisecond),
+		s.WithID("stable"),
+	))
 
 	var wg sync.WaitGroup
 	for g := range 4 {
@@ -995,10 +1003,7 @@ func TestStressConcurrentRegisterReplaceRemoveStop(t *testing.T) {
 			for i := 0; time.Now().Before(deadline); i++ {
 				id := fmt.Sprintf("stress-%d", (g+i)%6)
 				_ = scheduler.RegisterTask(
-					func(ctx context.Context, meta s.TriggerMetadata) error {
-						runs.Add(1)
-						return nil
-					},
+					func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
 					s.WithIntervalSchedule(time.Millisecond),
 					s.WithID(id),
 				)
@@ -1011,5 +1016,48 @@ func TestStressConcurrentRegisterReplaceRemoveStop(t *testing.T) {
 	wg.Wait()
 
 	assert.NoError(t, scheduler.Stop())
-	assert.Positive(t, runs.Load(), "tasks should have run")
+	assert.Positive(t, stableRuns.Load(), "an untouched task should keep running during the churn")
+}
+
+// fixedSchedule always triggers at a fixed offset from the moment Next is called.
+type fixedSchedule struct{ after time.Duration }
+
+func (f fixedSchedule) Next(ctx context.Context, schedulingStart time.Time, lastRun *time.Time) (time.Time, error) {
+	return time.Now().Add(f.after), nil
+}
+
+func TestSupersededTaskPendingTimerDoesNotRun(t *testing.T) {
+	for name, supersede := range map[string]func(scheduler s.Scheduler) error{
+		"replaced": func(scheduler s.Scheduler) error {
+			return scheduler.RegisterTask(
+				func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+				fixedSchedule{after: time.Hour},
+				s.WithID("task"),
+			)
+		},
+		"removed": func(scheduler s.Scheduler) error { return scheduler.RemoveTask("task") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				scheduler := s.New()
+				var oldRuns atomic.Int32
+
+				assert.NoError(t, scheduler.Start(t.Context()))
+				assert.NoError(t, scheduler.RegisterTask(
+					func(ctx context.Context, meta s.TriggerMetadata) error { oldRuns.Add(1); return nil },
+					fixedSchedule{after: 5 * time.Second},
+					s.WithID("task"),
+				))
+
+				tickXSeconds(1 * time.Second)
+				assert.NoError(t, supersede(scheduler))
+
+				tickXSeconds(10 * time.Second)
+				assert.Equal(t, int32(0), oldRuns.Load(), "old task must not run after its pending timer fires")
+
+				scheduler.Stop()
+			})
+		})
+	}
 }

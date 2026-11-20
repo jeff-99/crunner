@@ -143,13 +143,24 @@ type internalScheduler struct {
 
 	newTaskCh chan *schedulingUnit
 	tasksIn   chan *schedulingUnit
+	doneCh    chan runResult
+
+	// closed by mainLoop on exit; Stop waits on it before waiting for running tasks
+	loopDone chan struct{}
 
 	schedulingEpoch *time.Time
 
 	summaryInterval time.Duration
 
-	state   atomic.Int32
-	stateMu sync.Mutex
+	state atomic.Int32
+}
+
+// runResult is sent by a task goroutine to the main loop, the sole owner of
+// per-task mutable state, when a run has finished.
+type runResult struct {
+	unit  *schedulingUnit
+	start time.Time
+	err   error
 }
 
 type schedulingUnit struct {
@@ -183,6 +194,7 @@ func New(opts ...SchedulerOption) Scheduler {
 		tasks:           sync.Map{},
 		newTaskCh:       make(chan *schedulingUnit, channelBufferSize),
 		tasksIn:         make(chan *schedulingUnit, channelBufferSize),
+		doneCh:          make(chan runResult, channelBufferSize),
 		logger:          zerolog.Nop(), // Initialize with Nop logger by default
 		summaryInterval: 30 * time.Second,
 	}
@@ -225,22 +237,12 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 
 	// --- Overwrite Handling ---
 	// Before storing the new unit, check if one already exists with the same ID.
-	// If so, stop its timer and call its cancel callback.
+	// If so, call its cancel callback.
 	if existingValue, loaded := s.tasks.Load(newSchedulingUnit.ID()); loaded {
 		s.logger.Trace().Str("task", newSchedulingUnit.ID()).Msg("Overwriting existing task registration")
 		if existingUnit, ok := existingValue.(*schedulingUnit); ok {
-			// Use stateMu to prevent race with Stop() iterating timers
-			s.stateMu.Lock()
-			// Check state again after acquiring lock
-			currentState := s.state.Load()
-			if currentState == stateRunning || currentState == stateStopping {
-				if existingUnit.timer != nil {
-					stopped := existingUnit.timer.Stop()
-					s.logger.Trace().Str("task", newSchedulingUnit.ID()).Bool("timerStopped", stopped).Msg("Stopped timer for overwritten task")
-				}
-			}
-			s.stateMu.Unlock()
-
+			// The main loop stops the overwritten unit's timer when it sees the new unit;
+			// a stale timer that fires first is dropped by the main loop's identity check.
 			// Call the cancel callback of the *overwritten* task, if it exists
 			if existingUnit.onCancel != nil {
 				callbackCtx := context.Background() // Use background context for the callback
@@ -421,6 +423,7 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 	}
 
 	su.meta.ActualTriggerTime = now
+	metaCopy := *su.meta
 
 	s.logger.Trace().Str("task", su.ID()).Msg("Task running")
 
@@ -428,7 +431,6 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 	go func(taskUnit *schedulingUnit) {
 		defer s.wg.Done()
 		defer cancel()
-		metaCopy := *taskUnit.meta
 		var err error
 		func() {
 			taskCtx, taskCancel := context.WithTimeout(ctx, 30*24*time.Hour)
@@ -438,23 +440,14 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 
 		finished := time.Now()
 
-		taskUnit.meta.LastRunTime = &now
-		taskUnit.meta.Count++
-
 		if err != nil {
 			s.logger.Error().Err(err).Str("task", taskUnit.ID()).Msg("Task execution failed")
-			taskUnit.meta.LastErroredRunTime = &now
-			taskUnit.meta.ErrorCount++
-			taskUnit.meta.LastError = err
 			if taskUnit.onError != nil {
 				f := *taskUnit.onError
 				f(ctx, err)
 			}
 		} else {
 			s.logger.Debug().Str("task", taskUnit.ID()).Str("finished_time", finished.Format(time.RFC3339)).Str("start_time", now.Format(time.RFC3339)).Str("duration", finished.Sub(now).String()).Msgf("Task finished successfully")
-			taskUnit.meta.LastSuccessfulRunTime = &now
-			taskUnit.meta.SuccessfulCount++
-			taskUnit.meta.LastError = nil
 			if taskUnit.onSuccess != nil {
 				f := *taskUnit.onSuccess
 				f(ctx)
@@ -463,11 +456,44 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 
 		select {
 		case <-s.schedulerCtx.Done():
-			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Scheduler context done, not rescheduling task.")
-		case s.newTaskCh <- taskUnit:
-			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Task sent for rescheduling.")
+			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Scheduler context done, not reporting run result.")
+		case s.doneCh <- runResult{unit: taskUnit, start: now, err: err}:
+			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Run result sent to main loop.")
 		}
 	}(su)
+}
+
+// handleRunResult records a finished run on the main loop and reschedules the task if it is still registered.
+func (s *internalScheduler) handleRunResult(r runResult) {
+	su := r.unit
+	now := r.start
+
+	su.meta.LastRunTime = &now
+	su.meta.Count++
+	if r.err != nil {
+		su.meta.LastErroredRunTime = &now
+		su.meta.ErrorCount++
+		su.meta.LastError = r.err
+	} else {
+		su.meta.LastSuccessfulRunTime = &now
+		su.meta.SuccessfulCount++
+		su.meta.LastError = nil
+	}
+
+	if !s.isRegistered(su) {
+		s.logger.Trace().Str("task", su.ID()).Msg("Mainloop: Run result for overwritten or removed task, not rescheduling")
+		return
+	}
+	s.scheduleTask(su)
+}
+
+func (s *internalScheduler) isRegistered(su *schedulingUnit) bool {
+	currentVal, ok := s.tasks.Load(su.ID())
+	if !ok {
+		return false
+	}
+	currentUnit, isUnit := currentVal.(*schedulingUnit)
+	return isUnit && currentUnit == su
 }
 
 func (s *internalScheduler) emitTaskSummaries() {
@@ -512,6 +538,26 @@ func (s *internalScheduler) mainLoop() {
 	summaryTicker := time.NewTicker(s.summaryInterval)
 	defer summaryTicker.Stop()
 
+	// Units whose timers this loop owns, by task ID. Only the main loop touches
+	// unit timers; on exit it stops every one of them.
+	owned := make(map[string]*schedulingUnit)
+	defer func() {
+		for _, u := range owned {
+			if u.timer != nil {
+				u.timer.Stop()
+			}
+		}
+		close(s.loopDone)
+	}()
+	release := func(u *schedulingUnit) {
+		if u.timer != nil {
+			u.timer.Stop()
+		}
+		if owned[u.ID()] == u {
+			delete(owned, u.ID())
+		}
+	}
+
 	for {
 		select {
 		// Case 1: Context canceled (Stop() was called)
@@ -530,6 +576,10 @@ func (s *internalScheduler) mainLoop() {
 				if currentUnit, isUnit := currentVal.(*schedulingUnit); isUnit && currentUnit == receivedUnit {
 					// Only schedule if the received unit is the currently registered one.
 					s.logger.Trace().Str("task", receivedUnit.ID()).Msg("Mainloop: Received schedule/reschedule request")
+					if prev := owned[receivedUnit.ID()]; prev != nil && prev != receivedUnit {
+						release(prev) // superseded by an overwrite
+					}
+					owned[receivedUnit.ID()] = receivedUnit
 					s.scheduleTask(receivedUnit) // Calculate next run time and set timer
 				} else {
 					// Task was overwritten before this schedule request was processed.
@@ -538,6 +588,13 @@ func (s *internalScheduler) mainLoop() {
 			} else {
 				// Task was removed before this schedule request was processed.
 				s.logger.Trace().Str("task", receivedUnit.ID()).Msg("Mainloop: Received schedule request for removed task, ignoring")
+			}
+
+		// Case 3b: A task run finished
+		case r := <-s.doneCh:
+			s.handleRunResult(r)
+			if !s.isRegistered(r.unit) {
+				release(r.unit)
 			}
 
 		// Case 4: Task timer fired, ready for processing
@@ -551,10 +608,12 @@ func (s *internalScheduler) mainLoop() {
 				} else {
 					// The task was overwritten between timer firing and processing. Ignore.
 					s.logger.Trace().Str("task", su.ID()).Msg("Mainloop: Received ready task for overwritten task, ignoring")
+					release(su)
 				}
 			} else {
 				// The task was removed between timer firing and processing. Ignore.
 				s.logger.Trace().Str("task", su.ID()).Msg("Mainloop: Received ready task for removed task, ignoring")
+				release(su)
 			}
 		}
 	}
@@ -578,6 +637,8 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 	context, cancel := context.WithCancel(ctx)
 	s.cancelCtx = cancel
 	s.schedulerCtx = context
+
+	s.loopDone = make(chan struct{})
 
 	//nolint:contextcheck
 	go s.mainLoop()
@@ -614,15 +675,8 @@ func (s *internalScheduler) Stop() error {
 		s.cancelCtx()
 	}
 
-	s.stateMu.Lock()
-	s.tasks.Range(func(key, value interface{}) bool {
-		schedulingUnit := value.(*schedulingUnit)
-		if schedulingUnit.timer != nil {
-			schedulingUnit.timer.Stop()
-		}
-		return true
-	})
-	s.stateMu.Unlock()
+	// mainLoop stops all timers on exit; once it is done nothing adds to wg any more.
+	<-s.loopDone
 
 	s.wg.Wait()
 
@@ -651,15 +705,7 @@ func (s *internalScheduler) RemoveTask(id string) error {
 	s.tasks.Delete(id)
 	s.logger.Trace().Str("task", id).Msg("Removed task from map")
 
-	s.stateMu.Lock()
-	currentState := s.state.Load()
-	if currentState == stateRunning || currentState == stateStopping {
-		if su.timer != nil {
-			stopped := su.timer.Stop()
-			s.logger.Trace().Str("task", id).Bool("timerStoppedSuccessfully", stopped).Msg("Attempted to stop timer for removed task")
-		}
-	}
-	s.stateMu.Unlock()
+	// The unit's timer, if still pending, fires once and is dropped by the main loop.
 
 	callbackCtx := context.Background()
 	if s.schedulerCtx != nil {

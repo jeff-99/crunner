@@ -5,13 +5,13 @@
 
 ## 2. Main loop owns run results
 
-- [ ] 2.1 Copy trigger metadata on the main loop before starting the task goroutine and pass the copy to the task; verify existing metadata tests still pass
-- [ ] 2.2 Introduce a run-result message and `doneCh`; make the task goroutine send it instead of writing `meta` and sending on `newTaskCh`, and handle it in `mainLoop` (update counts/times/`LastError`, reschedule if still current); verify callbacks/count tests pass and the summary part of the stress test is race-free
+- [x] 2.1 Copy trigger metadata on the main loop before starting the task goroutine and pass the copy to the task; verify existing metadata tests still pass
+- [x] 2.2 Introduce a run-result message and `doneCh`; make the task goroutine send it instead of writing `meta` and sending on `newTaskCh`, and handle it in `mainLoop` (update counts/times/`LastError`, reschedule if still current); verify callbacks/count tests pass and the summary part of the stress test is race-free
 
 ## 3. Main loop owns timers
 
-- [ ] 3.1 Remove timer access from `RegisterTask` and `RemoveTask`; stop a superseded unit's timer on the main loop; add a `testing/synctest` test that a replaced/removed task never runs when its old timer fires; verify it passes
-- [ ] 3.2 Make `mainLoop` stop all owned timers on exit and signal completion; make `Stop` wait for it before `wg.Wait()`; remove `stateMu`; verify Stop/restart tests pass
+- [x] 3.1 Remove timer access from `RegisterTask` and `RemoveTask`; stop a superseded unit's timer on the main loop; add a `testing/synctest` test that a replaced/removed task never runs when its old timer fires; verify it passes
+- [x] 3.2 Make `mainLoop` stop all owned timers on exit and signal completion; make `Stop` wait for it before `wg.Wait()`; remove `stateMu`; verify Stop/restart tests pass
 
 ## 4. Verify
 
