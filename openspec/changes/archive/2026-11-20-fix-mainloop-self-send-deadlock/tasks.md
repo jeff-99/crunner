@@ -9,4 +9,4 @@
 
 ## 3. Verify
 
-- [ ] 3.1 Run `go test -race ./...` and verify the existing drift tests and new tests pass
+- [x] 3.1 Run `go test -race ./...` and verify the existing drift tests and new tests pass (note: the new drift tests pass under `-race` in isolation; the full suite still reports pre-existing races, fixed by `fix-shared-state-races`)
