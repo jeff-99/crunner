@@ -3,7 +3,9 @@ package crunner
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -425,13 +427,25 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		func() {
 			taskCtx, taskCancel := context.WithTimeout(ctx, 30*24*time.Hour)
 			defer taskCancel()
+			// Recover here, not around the whole goroutine, so the result is still
+			// recorded and the task rescheduled. runtime.Goexit is not a panic and is not handled.
+			defer func() {
+				if r := recover(); r != nil {
+					err = &PanicError{Value: r, Stack: debug.Stack()}
+				}
+			}()
 			err = taskUnit.task(taskCtx, metaCopy)
 		}()
 
 		finished := time.Now()
 
 		if err != nil {
-			s.logger.Error().Err(err).Str("task", taskUnit.ID()).Msg("Task execution failed")
+			logEvent := s.logger.Error().Err(err).Str("task", taskUnit.ID())
+			var panicErr *PanicError
+			if errors.As(err, &panicErr) {
+				logEvent = logEvent.Bytes("stack", panicErr.Stack)
+			}
+			logEvent.Msg("Task execution failed")
 			if taskUnit.onError != nil {
 				f := *taskUnit.onError
 				f(ctx, err)

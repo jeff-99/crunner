@@ -2,7 +2,9 @@ package crunner_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1142,5 +1144,108 @@ func TestConcurrentRemoveSameIDSucceedsOnce(t *testing.T) {
 		assert.Equal(t, int32(1), cancelled.Load(), "cancel callback fires exactly once")
 
 		scheduler.Stop()
+	})
+}
+
+func TestPanicErrorUnwrap(t *testing.T) {
+	t.Parallel()
+	var err error = fmt.Errorf("wrapped: %w", &s.PanicError{Value: io.EOF})
+
+	var pe *s.PanicError
+	assert.True(t, errors.As(err, &pe))
+	assert.True(t, errors.Is(err, io.EOF))
+
+	assert.NoError(t, (&s.PanicError{Value: "boom"}).Unwrap())
+	assert.Contains(t, (&s.PanicError{Value: "boom"}).Error(), "boom")
+}
+
+func TestPanickingTaskIsReportedAsError(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var mu sync.Mutex
+		var gotErr error
+		var successes atomic.Int32
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { panic("boom") },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("panicker"),
+			s.WithErrorCallback(func(ctx context.Context, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				gotErr = err
+			}),
+			s.WithSuccessCallback(func(ctx context.Context) { successes.Add(1) }),
+		))
+
+		tickXSeconds(1 * time.Second)
+		scheduler.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		var pe *s.PanicError
+		if assert.True(t, errors.As(gotErr, &pe), "error callback should receive a *PanicError") {
+			assert.Equal(t, "boom", pe.Value)
+			assert.NotEmpty(t, pe.Stack)
+		}
+		assert.Equal(t, int32(0), successes.Load())
+	})
+}
+
+func TestPanickingTaskKeepsRunningAndDoesNotAffectOthers(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var panics, healthy, errorCallbacks atomic.Int32
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { panics.Add(1); panic("always") },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("panicker"),
+			s.WithErrorCallback(func(ctx context.Context, err error) { errorCallbacks.Add(1) }),
+		))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { healthy.Add(1); return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("healthy"),
+		))
+
+		tickXSeconds(5 * time.Second)
+		scheduler.Stop()
+
+		assert.Equal(t, int32(5), panics.Load(), "panicking task is rescheduled on every window")
+		assert.Equal(t, int32(5), errorCallbacks.Load())
+		assert.Equal(t, int32(5), healthy.Load(), "healthy task keeps its schedule")
+	})
+}
+
+func TestPanicWithErrorValueUnwraps(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var mu sync.Mutex
+		var gotErr error
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { panic(io.EOF) },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("eof"),
+			s.WithErrorCallback(func(ctx context.Context, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				gotErr = err
+			}),
+		))
+
+		tickXSeconds(1 * time.Second)
+		scheduler.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.True(t, errors.Is(gotErr, io.EOF))
 	})
 }
