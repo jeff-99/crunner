@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Pluggable schedules
-The library SHALL accept any schedule that, given a scheduling start time and an optional reference time, returns the next run time or an error. The reference time SHALL be the end of the task's previous trigger window, or absent for the first window.
+The library SHALL accept any schedule that, given a scheduling start time and an optional reference time, returns the next run time or an error. The reference time SHALL be a previous point of the task's window sequence — normally the end of the task's previous trigger window — and never the actual start of a run. It is absent for the first window.
 
 #### Scenario: Custom schedule
 - **WHEN** a task is registered with a user-defined schedule
@@ -16,7 +16,7 @@ The library SHALL accept any schedule that, given a scheduling start time and an
 - **THEN** the reference time passed to the schedule is T
 
 ### Requirement: Interval schedule
-The library SHALL provide an interval schedule whose next run is the previous window end plus the interval, or the scheduling start plus the interval when the task has no previous window.
+The library SHALL provide an interval schedule whose next run is the reference time plus the interval, or the scheduling start plus the interval when there is no reference time.
 
 #### Scenario: First interval run
 - **WHEN** an interval task has not run yet
