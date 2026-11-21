@@ -8,6 +8,13 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// Schedule computes the end of a task's next trigger window.
+//
+// schedulingStart is the start of the window being computed. lastRun is a previous point of the
+// task's window sequence (normally the end of the previous window), or nil for the task's first
+// window. It is never the time a run actually started, so windows stay on the schedule's grid.
+// After a run is cancelled for drift, Next may be called several times in a row, each time with
+// the previous result, until the returned time is in the future.
 type Schedule interface {
 	Next(ctx context.Context, schedulingStart time.Time, lastRun *time.Time) (time.Time, error)
 }
@@ -90,6 +97,9 @@ func (i intervalSchedule) validate() error {
 	return nil
 }
 
+// WithIntervalSchedule returns a schedule whose windows are interval long: the next window ends at
+// the reference time (the previous window end) plus interval, or at the scheduling start plus
+// interval for the first window.
 func WithIntervalSchedule(interval time.Duration) intervalSchedule {
 	return intervalSchedule{Interval: interval}
 }

@@ -61,6 +61,11 @@ func WithDefaultOptions() SchedulingOptions {
 	}
 }
 
+// WithMaxDrift sets how late a run may start relative to its expected trigger time (default 30s).
+// A later run is cancelled: it is not executed, the cancel callback is called once, and its window is
+// merged into the next run's window, which fires at the schedule's next point after now. For long
+// intervals (e.g. a daily cron) that means a cancelled run's work waits up to one interval, so use a
+// larger MaxDrift for such tasks.
 func WithMaxDrift(d time.Duration) SchedulingOption {
 	return func(o *SchedulingOptions) {
 		o.MaxDrift = d
@@ -117,6 +122,10 @@ type Scheduler interface {
 	Stop() error
 }
 
+// TriggerMetadata describes a run. Its trigger window [TriggerWindowStart, TriggerWindowEnd) is
+// contiguous with the task's previous window and lies on the schedule's grid. A window normally spans
+// one step of the schedule, but after a run was cancelled for drift it spans several steps, so do not
+// assume TriggerWindowEnd - TriggerWindowStart equals the interval.
 type TriggerMetadata struct {
 	ExpectedTriggerTime time.Time
 	ActualTriggerTime   time.Time
@@ -150,8 +159,6 @@ type internalScheduler struct {
 	// closed by mainLoop on exit; Stop waits on it before waiting for running tasks
 	loopDone chan struct{}
 
-	schedulingEpoch *time.Time
-
 	summaryInterval time.Duration
 
 	state atomic.Int32
@@ -160,18 +167,26 @@ type internalScheduler struct {
 // runResult is sent by a task goroutine to the main loop, the sole owner of
 // per-task mutable state, when a run has finished.
 type runResult struct {
-	unit  *schedulingUnit
-	start time.Time
-	err   error
+	unit   *schedulingUnit
+	start  time.Time
+	finish time.Time
+	err    error
 }
 
 type schedulingUnit struct {
 	task     Task
 	schedule Schedule
 
-	meta      *TriggerMetadata
-	options   SchedulingOptions
-	createdAt time.Time
+	meta    *TriggerMetadata
+	options SchedulingOptions
+
+	// coveredUntil is the end of the last executed window; every new window starts here.
+	// It is zero until the unit is first scheduled while the scheduler runs, which sets the window origin.
+	coveredUntil time.Time
+	// hasRun reports whether any window has been executed, i.e. whether coveredUntil is a previous window end.
+	hasRun bool
+	// previousFinish is when the previous run finished; a run is never expected before it.
+	previousFinish time.Time
 
 	timer *time.Timer
 
@@ -236,11 +251,10 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 	}
 
 	newSchedulingUnit := &schedulingUnit{
-		task:      task,
-		schedule:  schedule,
-		options:   opts,
-		meta:      &TriggerMetadata{},
-		createdAt: time.Now(),
+		task:     task,
+		schedule: schedule,
+		options:  opts,
+		meta:     &TriggerMetadata{},
 
 		onSuccess: opts.OnSuccess,
 		onError:   opts.OnError,
@@ -281,6 +295,14 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 }
 
 func (s *internalScheduler) scheduleTask(su *schedulingUnit) {
+	s.scheduleWindow(su, nil)
+}
+
+// scheduleWindow computes the task's next window and sets its timer. Every window starts at
+// coveredUntil. Normally the window ends at the schedule's next point after that start. When
+// cancelledEnd is set, the previous window was cancelled for drift: the new window then also covers
+// it and ends at the first point of the schedule after now.
+func (s *internalScheduler) scheduleWindow(su *schedulingUnit, cancelledEnd *time.Time) {
 	if s.state.Load() != stateRunning {
 		s.logger.Trace().Str("task", su.ID()).Msg("Scheduler not running, skipping task scheduling")
 		return
@@ -290,65 +312,55 @@ func (s *internalScheduler) scheduleTask(su *schedulingUnit) {
 	ctx, cancel := context.WithTimeout(s.schedulerCtx, 1*time.Minute)
 	defer cancel()
 
-	previousRunMeta := su.meta
 	isBackfill := su.options.Backfill && su.options.NotBefore != nil
-	hasCaughtUp := false
 	now := time.Now()
 
-	var triggerWindowStart, triggerWindowEnd, expectedTriggerTime time.Time
-	var calculationBaseTime time.Time
-	var calculationEpoch time.Time
-
-	if !previousRunMeta.TriggerWindowEnd.IsZero() {
-		// has already run once and we are not backfilling
-		calculationBaseTime = previousRunMeta.TriggerWindowEnd // TODO this looks wrong, but breaks the tests if I change it to the schudulingEpoch (which seems right?)
-	} else if isBackfill {
-		calculationBaseTime = *su.options.NotBefore
-	} else {
-		// if s.schedulingEpoch == nil {
-		// 	s.logger.Error().Str("task", su.ID()).Msg("BUG: schedulingEpoch is nil during scheduleTask. Scheduler might not have been started correctly.")
-		// 	calculationBaseTime = now
-		// } else {
-		// 	calculationBaseTime = *s.schedulingEpoch
-		// }
-		calculationBaseTime = su.createdAt
-	}
-	calculationEpoch = calculationBaseTime
-
-	// Determine the appropriate last run time to pass to schedule.Next
-	var lastRunPtr *time.Time
-	if isBackfill {
-		// When backfilling, we want to continue from where we left off (TriggerWindowEnd)
-		// but only if we've already run at least once
-		if !previousRunMeta.TriggerWindowEnd.IsZero() {
-			lastRunPtr = &previousRunMeta.TriggerWindowEnd
+	if su.coveredUntil.IsZero() {
+		// Window origin: NotBefore when backfilling, otherwise the moment the task is first scheduled.
+		if isBackfill {
+			su.coveredUntil = *su.options.NotBefore
+		} else {
+			su.coveredUntil = now
 		}
-	} else {
-		// For normal scheduling, use the actual LastRunTime if available
-		lastRunPtr = previousRunMeta.LastRunTime
 	}
+	triggerWindowStart := su.coveredUntil
 
-	nextWindowEnd, err := su.schedule.Next(ctx, calculationEpoch, lastRunPtr)
+	var triggerWindowEnd time.Time
+	var err error
+	if cancelledEnd == nil {
+		var ref *time.Time
+		if su.hasRun {
+			ref = &triggerWindowStart
+		}
+		triggerWindowEnd, err = su.schedule.Next(ctx, triggerWindowStart, ref)
+	} else {
+		triggerWindowEnd = *cancelledEnd
+		for err == nil && !triggerWindowEnd.After(now) {
+			var next time.Time
+			next, err = su.schedule.Next(ctx, triggerWindowStart, &triggerWindowEnd)
+			if err == nil && !next.After(triggerWindowEnd) {
+				err = fmt.Errorf("schedule did not advance past %s", triggerWindowEnd)
+			}
+			triggerWindowEnd = next
+		}
+	}
 	if err != nil {
-		s.logger.Error().Err(err).Str("task", su.ID()).Time("calculationBaseTime", calculationBaseTime).Msg("Failed to get next run time from schedule")
+		s.logger.Error().Err(err).Str("task", su.ID()).Time("windowStart", triggerWindowStart).Msg("Failed to get next run time from schedule")
 		return
 	}
 
-	if isBackfill && nextWindowEnd.After(now) {
-		hasCaughtUp = true
-	}
-
-	triggerWindowStart = calculationBaseTime
-	triggerWindowEnd = nextWindowEnd
-
-	if isBackfill && !hasCaughtUp {
+	var expectedTriggerTime time.Time
+	if isBackfill && !triggerWindowEnd.After(now) {
 		expectedTriggerTime = now
 		su.backfilling = true
 		s.logger.Trace().Str("task", su.ID()).Time("windowStart", triggerWindowStart).Time("windowEnd", triggerWindowEnd).Msg("Task is backfilling")
 	} else {
+		// A run is never expected before the previous run finished, so a long run cannot make its successor late.
 		expectedTriggerTime = triggerWindowEnd
+		if su.previousFinish.After(expectedTriggerTime) {
+			expectedTriggerTime = su.previousFinish
+		}
 		su.backfilling = false
-		s.logger.Trace().Str("task", su.ID()).Time("windowStart", triggerWindowStart).Time("windowEnd", triggerWindowEnd).Msg("Task is normal or backfill caught up")
 	}
 
 	su.meta.TriggerWindowStart = triggerWindowStart
@@ -403,11 +415,7 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 	mayExecute := drift <= su.options.MaxDrift
 
 	if !mayExecute {
-		s.logger.Warn().Str("task", su.ID()).Time("expectedTriggerTime", su.meta.ExpectedTriggerTime).Time("actualTime", now).Dur("drift", drift).Dur("maxDrift", su.options.MaxDrift).Msg("Task execution skipped due to excessive drift")
-
-		// issue when a task is skipped due to excessive drift the task will be rescheduled, but that task will also be skipped. So the task will never run again.
-		// so we need to set the last run time to now, so that the next run will be scheduled correctly.
-		su.meta.LastRunTime = &now
+		s.logger.Warn().Str("task", su.ID()).Time("expectedTriggerTime", su.meta.ExpectedTriggerTime).Time("actualTime", now).Dur("drift", drift).Dur("maxDrift", su.options.MaxDrift).Time("windowStart", su.meta.TriggerWindowStart).Time("windowEnd", su.meta.TriggerWindowEnd).Msg("Task run cancelled due to excessive drift; its window is merged into the next run")
 
 		if su.onCancel != nil {
 			f := *su.onCancel
@@ -420,7 +428,8 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		} else {
 			cancel()
 		}
-		s.scheduleTask(su)
+		cancelledEnd := su.meta.TriggerWindowEnd
+		s.scheduleWindow(su, &cancelledEnd)
 		return
 	}
 
@@ -471,7 +480,7 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		select {
 		case <-s.schedulerCtx.Done():
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Scheduler context done, not reporting run result.")
-		case s.doneCh <- runResult{unit: taskUnit, start: now, err: err}:
+		case s.doneCh <- runResult{unit: taskUnit, start: now, finish: finished, err: err}:
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Run result sent to main loop.")
 		}
 	}(su)
@@ -484,6 +493,9 @@ func (s *internalScheduler) handleRunResult(r runResult) {
 
 	su.meta.LastRunTime = &now
 	su.meta.Count++
+	su.coveredUntil = su.meta.TriggerWindowEnd
+	su.hasRun = true
+	su.previousFinish = r.finish
 	if r.err != nil {
 		su.meta.LastErroredRunTime = &now
 		su.meta.ErrorCount++
@@ -644,8 +656,6 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 		return fmt.Errorf("scheduler cannot start from state %d", currentState)
 	}
 
-	now := time.Now()
-	s.schedulingEpoch = &now
 	s.logger.Trace().Msg("Starting scheduler")
 
 	context, cancel := context.WithCancel(ctx)
