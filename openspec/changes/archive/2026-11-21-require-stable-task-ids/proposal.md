@@ -1,6 +1,6 @@
 ## Why
 
-`schedulingUnit.ID()` (scheduler.go ~199-206) returns a fresh random ID on every call when the stored ID is empty (e.g. `WithID("")`). Such a task is stored under one ID, looked up under another, and is therefore never scheduled and can never be removed. The default ID is also generated inside `WithDefaultOptions()` (~57), so identity is tied to an options constructor rather than to registration.
+`schedulingUnit.ID()` (scheduler.go ~199-206) returns a fresh random ID on every call when the stored ID is empty (`WithID("")`). Such a task is stored under one ID, looked up under another, and is therefore never scheduled and can never be removed. The default ID is also generated inside `WithDefaultOptions()` (~57), so identity is tied to an options constructor rather than to registration.
 
 ## What Changes
 

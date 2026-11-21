@@ -83,7 +83,6 @@ type SchedulingOption func(*SchedulingOptions)
 func WithDefaultOptions() SchedulingOptions {
 	return SchedulingOptions{
 		MaxDrift: 30 * time.Second,
-		ID:       "task-" + rand.Text(),
 		Backfill: false,
 	}
 }
@@ -265,13 +264,9 @@ func New(opts ...SchedulerOption) Scheduler {
 	return scheduler
 }
 
+// ID returns the task's ID, fixed at registration.
 func (su *schedulingUnit) ID() string {
-	id := su.options.ID
-	if id == "" {
-		return "task-" + rand.Text()
-	} else {
-		return id
-	}
+	return su.options.ID
 }
 
 // RegisterTask stores a task under its ID, replacing any task already registered with that ID.
@@ -283,6 +278,11 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 	opts := WithDefaultOptions()
 	for _, opt := range options {
 		opt(&opts)
+	}
+
+	// The ID is fixed here, once: an empty ID means "generate one".
+	if opts.ID == "" {
+		opts.ID = "task-" + rand.Text()
 	}
 
 	// Validate before anything has side effects, so a rejected registration leaves an existing task untouched.

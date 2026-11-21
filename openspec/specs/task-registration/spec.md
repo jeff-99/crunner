@@ -22,7 +22,7 @@ The scheduler SHALL accept a task function, a schedule and per-task options, and
 - **THEN** RegisterTask returns nil
 
 ### Requirement: Task identity
-Each task SHALL have an ID. When no ID is given, a random ID prefixed with `task-` is generated.
+Each task SHALL have an ID that is fixed at registration and does not change for the lifetime of the registration. When no ID is given, or the given ID is empty, the scheduler SHALL generate exactly one random ID prefixed with `task-` at registration and use it for every subsequent lookup, scheduling, replacement and removal of that task.
 
 #### Scenario: Explicit ID
 - **WHEN** a task is registered with an ID option
@@ -31,6 +31,18 @@ Each task SHALL have an ID. When no ID is given, a random ID prefixed with `task
 #### Scenario: Generated ID
 - **WHEN** a task is registered without an ID option
 - **THEN** the task is stored under a generated `task-` ID
+
+#### Scenario: Empty ID
+- **WHEN** a task is registered with an empty ID option on a running scheduler
+- **THEN** the task is stored under a generated `task-` ID and runs on its schedule
+
+#### Scenario: Generated ID is stable
+- **WHEN** a task with a generated ID has been registered
+- **THEN** the same ID is used for every run of the task and removing the task by that ID succeeds
+
+#### Scenario: Generated IDs are distinct
+- **WHEN** two tasks are registered without an ID option
+- **THEN** each is stored under a different generated ID and both run
 
 ### Requirement: Replacing a task
 Registering a task with an ID that is already registered SHALL replace the existing task: its pending timer is stopped, its cancel callback is invoked asynchronously, and only the new task is scheduled from then on. Replacement SHALL be atomic: when registrations with the same ID race, exactly one task ends up registered and every other task registered under that ID is displaced and has its cancel callback invoked exactly once.
