@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -341,15 +342,19 @@ func TestTriggerMetadataInTask(t *testing.T) {
 
 		schedulingStart := time.Now()
 
-		var expected, actual, triggerWindowStart, triggerWindowEnd time.Time
+		var mu sync.Mutex
+		var last s.TriggerMetadata
 
 		task := func(ctx context.Context, meta s.TriggerMetadata) error {
-			expected = meta.ExpectedTriggerTime
-			actual = meta.ActualTriggerTime
-
-			triggerWindowStart = meta.TriggerWindowStart
-			triggerWindowEnd = meta.TriggerWindowEnd
+			mu.Lock()
+			defer mu.Unlock()
+			last = meta
 			return nil
+		}
+		snapshot := func() (expected, actual, triggerWindowStart, triggerWindowEnd time.Time) {
+			mu.Lock()
+			defer mu.Unlock()
+			return last.ExpectedTriggerTime, last.ActualTriggerTime, last.TriggerWindowStart, last.TriggerWindowEnd
 		}
 
 		scheduler.Start(t.Context())
@@ -363,6 +368,7 @@ func TestTriggerMetadataInTask(t *testing.T) {
 		// trigger the first execution
 		tickXSeconds(1 * time.Second)
 
+		expected, actual, triggerWindowStart, triggerWindowEnd := snapshot()
 		assert.Equal(t, time.Time{}, expected)
 		assert.Equal(t, time.Time{}, actual)
 		assert.Equal(t, time.Time{}, triggerWindowStart)
@@ -371,6 +377,8 @@ func TestTriggerMetadataInTask(t *testing.T) {
 		// trigger the second execution
 		tickXSeconds(1 * time.Second)
 
+		expected, actual, triggerWindowStart, triggerWindowEnd = snapshot()
+
 		assert.Equal(t, schedulingStart.Add(2*time.Second), expected)
 		assert.Equal(t, schedulingStart.Add(2*time.Second), actual)
 		assert.Equal(t, schedulingStart, triggerWindowStart)
@@ -378,6 +386,8 @@ func TestTriggerMetadataInTask(t *testing.T) {
 
 		// schedule to next trigger
 		tickXSeconds(2 * time.Second)
+
+		expected, actual, triggerWindowStart, triggerWindowEnd = snapshot()
 
 		assert.Equal(t, schedulingStart.Add(4*time.Second), expected)
 		assert.Equal(t, schedulingStart.Add(4*time.Second), actual)
@@ -480,6 +490,9 @@ func TestTaskTriggerWindows(t *testing.T) {
 
 				tickXSeconds(time.Duration(numberOfIntervals) * interval)
 
+				// Stop waits for running tasks, so reading windows afterwards is race-free.
+				scheduler.Stop()
+
 				if interval%time.Second == 0 {
 					// interval task always start immediately, so we should have one more window than the number of intervals
 					assert.Equal(t, int(numberOfIntervals), len(windows))
@@ -499,8 +512,6 @@ func TestTaskTriggerWindows(t *testing.T) {
 						assert.Equal(t, epoch.Add(time.Duration(i+1)*interval), w.end)
 					}
 				}
-
-				scheduler.Stop()
 			})
 		})
 	}
@@ -571,6 +582,9 @@ func TestTaskTriggerWindowsWithBackfill(t *testing.T) {
 
 				tickXSeconds(time.Duration(numberOfIntervals) * interval)
 
+				// Stop waits for running tasks, so reading windows afterwards is race-free.
+				scheduler.Stop()
+
 				// with backfill enabled and a start time before the epoch, so we can calculate the number of backfill jobs and add them to the number of intervals
 				// backfills := int(startTimeDelta / interval)
 				// assert.Equal(t, int(numberOfIntervals)+backfills, len(windows))
@@ -584,7 +598,6 @@ func TestTaskTriggerWindowsWithBackfill(t *testing.T) {
 					assert.Equal(t, windowEpoch.Add(time.Duration(i)*interval), w.start)
 					assert.Equal(t, windowEpoch.Add(time.Duration(i+1)*interval), w.end)
 				}
-				scheduler.Stop()
 			})
 		})
 	}
@@ -964,5 +977,170 @@ func TestBlockingDriftSkipCallbackDoesNotBlockOtherTasks(t *testing.T) {
 		close(release)
 		<-callbackReturned
 		<-stopped
+	})
+}
+
+func TestStressConcurrentRegisterReplaceRemoveStop(t *testing.T) {
+	scheduler := s.New(s.WithSummaryInterval(time.Millisecond))
+	assert.NoError(t, scheduler.Start(t.Context()))
+
+	var stableRuns atomic.Int64
+	assert.NoError(t, scheduler.RegisterTask(
+		func(ctx context.Context, meta s.TriggerMetadata) error {
+			stableRuns.Add(1)
+			return nil
+		},
+		s.WithIntervalSchedule(time.Millisecond),
+		s.WithID("stable"),
+	))
+
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			deadline := time.Now().Add(300 * time.Millisecond)
+			for i := 0; time.Now().Before(deadline); i++ {
+				id := fmt.Sprintf("stress-%d", (g+i)%6)
+				_ = scheduler.RegisterTask(
+					func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+					s.WithIntervalSchedule(time.Millisecond),
+					s.WithID(id),
+				)
+				if i%3 == 0 {
+					_ = scheduler.RemoveTask(id)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.NoError(t, scheduler.Stop())
+	assert.Positive(t, stableRuns.Load(), "an untouched task should keep running during the churn")
+}
+
+// fixedSchedule always triggers at a fixed offset from the moment Next is called.
+type fixedSchedule struct{ after time.Duration }
+
+func (f fixedSchedule) Next(ctx context.Context, schedulingStart time.Time, lastRun *time.Time) (time.Time, error) {
+	return time.Now().Add(f.after), nil
+}
+
+func TestSupersededTaskPendingTimerDoesNotRun(t *testing.T) {
+	for name, supersede := range map[string]func(scheduler s.Scheduler) error{
+		"replaced": func(scheduler s.Scheduler) error {
+			return scheduler.RegisterTask(
+				func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+				fixedSchedule{after: time.Hour},
+				s.WithID("task"),
+			)
+		},
+		"removed": func(scheduler s.Scheduler) error { return scheduler.RemoveTask("task") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				scheduler := s.New()
+				var oldRuns atomic.Int32
+
+				assert.NoError(t, scheduler.Start(t.Context()))
+				assert.NoError(t, scheduler.RegisterTask(
+					func(ctx context.Context, meta s.TriggerMetadata) error { oldRuns.Add(1); return nil },
+					fixedSchedule{after: 5 * time.Second},
+					s.WithID("task"),
+				))
+
+				tickXSeconds(1 * time.Second)
+				assert.NoError(t, supersede(scheduler))
+
+				tickXSeconds(10 * time.Second)
+				assert.Equal(t, int32(0), oldRuns.Load(), "old task must not run after its pending timer fires")
+
+				scheduler.Stop()
+			})
+		})
+	}
+}
+
+func TestConcurrentRegistrationsSameIDCancelDisplacedExactlyOnce(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+
+		const n = 50
+		var runs atomic.Int32
+		cancels := make([]atomic.Int32, n)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				assert.NoError(t, scheduler.RegisterTask(
+					func(ctx context.Context, meta s.TriggerMetadata) error { runs.Add(1); return nil },
+					s.WithIntervalSchedule(time.Second),
+					s.WithID("same"),
+					s.WithCancelCallback(func(ctx context.Context) { cancels[i].Add(1) }),
+				))
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		tickXSeconds(1 * time.Second)
+
+		total := int32(0)
+		for i := range cancels {
+			c := cancels[i].Load()
+			assert.LessOrEqual(t, c, int32(1), "cancel callback %d must fire at most once", i)
+			total += c
+		}
+		assert.Equal(t, int32(n-1), total, "every displaced task is cancelled exactly once")
+		assert.Equal(t, int32(1), runs.Load(), "exactly one registration remains and runs")
+		assert.Len(t, scheduler.ScheduledTasks(), 1)
+
+		scheduler.Stop()
+	})
+}
+
+func TestConcurrentRemoveSameIDSucceedsOnce(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+
+		var cancelled atomic.Int32
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("victim"),
+			s.WithCancelCallback(func(ctx context.Context) { cancelled.Add(1) }),
+		))
+
+		const n = 50
+		var successes atomic.Int32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if scheduler.RemoveTask("victim") == nil {
+					successes.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), successes.Load(), "exactly one RemoveTask succeeds")
+		assert.Equal(t, int32(1), cancelled.Load(), "cancel callback fires exactly once")
+
+		scheduler.Stop()
 	})
 }
