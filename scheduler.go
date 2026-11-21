@@ -219,10 +219,20 @@ func (su *schedulingUnit) ID() string {
 	}
 }
 
+// RegisterTask stores a task under its ID, replacing any task already registered with that ID.
+// It returns an error, wrapping ErrInvalidTask, ErrInvalidSchedule and/or ErrInvalidOption, and registers
+// nothing (an existing task with the same ID is left untouched) when: the task or schedule is nil, an
+// interval is not positive, MaxDrift is negative, NotAfter is not after NotBefore, backfill is enabled
+// without NotBefore, or a callback is nil.
 func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options ...SchedulingOption) error {
 	opts := WithDefaultOptions()
 	for _, opt := range options {
 		opt(&opts)
+	}
+
+	// Validate before anything has side effects, so a rejected registration leaves an existing task untouched.
+	if err := validateRegistration(task, schedule, opts); err != nil {
+		return err
 	}
 
 	newSchedulingUnit := &schedulingUnit{

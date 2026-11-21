@@ -22,3 +22,15 @@ func TestZeroValueCronScheduleDoesNotPanic(t *testing.T) {
 		assert.NoError(t, err)
 	})
 }
+
+func TestScheduleValidate(t *testing.T) {
+	parsed, err := ParseCron("* * * * *", false)
+	assert.NoError(t, err)
+
+	assert.NoError(t, WithIntervalSchedule(time.Second).validate())
+	assert.Error(t, WithIntervalSchedule(0).validate())
+	assert.Error(t, WithIntervalSchedule(-time.Second).validate())
+
+	assert.NoError(t, cronSchedule{schedule: parsed}.validate())
+	assert.Error(t, cronSchedule{}.validate(), "zero-value cron schedule must be rejected")
+}

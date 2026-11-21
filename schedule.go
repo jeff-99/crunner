@@ -64,6 +64,13 @@ func (c cronSchedule) Next(ctx context.Context, now time.Time, lastRun *time.Tim
 	return c.schedule.Next(base.In(location)), nil
 }
 
+func (c cronSchedule) validate() error {
+	if c.schedule == nil {
+		return fmt.Errorf("cron schedule is not initialised, use WithCronSchedule")
+	}
+	return nil
+}
+
 type intervalSchedule struct {
 	Interval time.Duration
 }
@@ -74,6 +81,13 @@ func (i intervalSchedule) Next(ctx context.Context, schedulingStart time.Time, l
 	}
 
 	return (*lastRun).Add(i.Interval), nil
+}
+
+func (i intervalSchedule) validate() error {
+	if i.Interval <= 0 {
+		return fmt.Errorf("interval must be positive, got %s", i.Interval)
+	}
+	return nil
 }
 
 func WithIntervalSchedule(interval time.Duration) intervalSchedule {

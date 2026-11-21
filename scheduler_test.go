@@ -155,14 +155,13 @@ func TestSchedulingTaskAfterXIntervalsOfRunning(t *testing.T) {
 		// and then register the task
 		tickXSeconds(5 * time.Second)
 
-		
 		scheduler.RegisterTask(
 			s.SimpleTask(intervalTask),
 			s.WithIntervalSchedule(1*time.Second),
 			s.WithID("interval-task"),
 		)
-		
-		schedule, _ := s.WithCronSchedule("* * * * * *", time.Now().Location() ,true)
+
+		schedule, _ := s.WithCronSchedule("* * * * * *", time.Now().Location(), true)
 		scheduler.RegisterTask(
 			s.SimpleTask(cronTask),
 			schedule,
@@ -683,7 +682,7 @@ func TestRegisterTaskOverwrite(t *testing.T) {
 
 		// Register Task 2 with the same ID, overwriting Task 1
 		err = scheduler.RegisterTask(
-			task2,                               // Different task function
+			task2,                                 // Different task function
 			s.WithIntervalSchedule(1*time.Second), // Same schedule
 			s.WithID(taskID),                      // Same ID
 		)
@@ -1247,5 +1246,101 @@ func TestPanicWithErrorValueUnwraps(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		assert.True(t, errors.Is(gotErr, io.EOF))
+	})
+}
+
+func TestRegisterTaskValidation(t *testing.T) {
+	t.Parallel()
+	okTask := func(ctx context.Context, meta s.TriggerMetadata) error { return nil }
+	now := time.Now()
+	var nilSuccess s.SuccessCallback
+	var nilError s.ErrorCallback
+	var nilCancel s.CancelCallback
+
+	tests := map[string]struct {
+		task     s.Task
+		schedule s.Schedule
+		opts     []s.SchedulingOption
+		wantErrs []error
+	}{
+		"nil task":                    {nil, s.WithIntervalSchedule(time.Second), nil, []error{s.ErrInvalidTask}},
+		"nil schedule":                {okTask, nil, nil, []error{s.ErrInvalidSchedule}},
+		"typed nil":                   {okTask, (*lateOnceSchedule)(nil), nil, []error{s.ErrInvalidSchedule}},
+		"zero interval":               {okTask, s.WithIntervalSchedule(0), nil, []error{s.ErrInvalidSchedule}},
+		"negative interval":           {okTask, s.WithIntervalSchedule(-time.Second), nil, []error{s.ErrInvalidSchedule}},
+		"negative drift":              {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithMaxDrift(-time.Second)}, []error{s.ErrInvalidOption}},
+		"not after equals not before": {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithNotBefore(now), s.WithNotAfter(now)}, []error{s.ErrInvalidOption}},
+		"not after before not before": {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithNotBefore(now), s.WithNotAfter(now.Add(-time.Hour))}, []error{s.ErrInvalidOption}},
+		"backfill without not before": {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithBackfill()}, []error{s.ErrInvalidOption}},
+		"nil success callback":        {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithSuccessCallback(nilSuccess)}, []error{s.ErrInvalidOption}},
+		"nil error callback":          {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithErrorCallback(nilError)}, []error{s.ErrInvalidOption}},
+		"nil cancel callback":         {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithCancelCallback(nilCancel)}, []error{s.ErrInvalidOption}},
+		"multiple problems":           {nil, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithMaxDrift(-time.Second)}, []error{s.ErrInvalidTask, s.ErrInvalidOption}},
+		"all three kinds":             {nil, nil, []s.SchedulingOption{s.WithMaxDrift(-time.Second)}, []error{s.ErrInvalidTask, s.ErrInvalidSchedule, s.ErrInvalidOption}},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			scheduler := s.New()
+			err := scheduler.RegisterTask(tc.task, tc.schedule, tc.opts...)
+			if assert.Error(t, err) {
+				for _, want := range tc.wantErrs {
+					assert.ErrorIs(t, err, want)
+				}
+			}
+			assert.Empty(t, scheduler.ScheduledTasks(), "nothing may be stored for a rejected registration")
+		})
+	}
+}
+
+func TestRegisterTaskValidRegistrationsAreAccepted(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	okTask := func(ctx context.Context, meta s.TriggerMetadata) error { return nil }
+
+	for name, opts := range map[string][]s.SchedulingOption{
+		"defaults":       nil,
+		"zero drift":     {s.WithMaxDrift(0)},
+		"valid range":    {s.WithNotBefore(now), s.WithNotAfter(now.Add(time.Hour))},
+		"backfill":       {s.WithNotBefore(now.Add(-time.Hour)), s.WithBackfill()},
+		"only not after": {s.WithNotAfter(now)},
+		"all callbacks":  {s.WithSuccessCallback(func(context.Context) {}), s.WithErrorCallback(func(context.Context, error) {}), s.WithCancelCallback(func(context.Context) {})},
+	} {
+		t.Run(name, func(t *testing.T) {
+			scheduler := s.New()
+			assert.NoError(t, scheduler.RegisterTask(okTask, s.WithIntervalSchedule(time.Second), opts...))
+			assert.Len(t, scheduler.ScheduledTasks(), 1)
+		})
+	}
+}
+
+func TestRejectedRegistrationLeavesExistingTaskIntact(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var runs, cancels atomic.Int32
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { runs.Add(1); return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("a"),
+			s.WithCancelCallback(func(ctx context.Context) { cancels.Add(1) }),
+		))
+
+		err := scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			s.WithIntervalSchedule(0),
+			s.WithID("a"),
+		)
+		assert.ErrorIs(t, err, s.ErrInvalidSchedule)
+
+		tickXSeconds(3 * time.Second)
+		scheduler.Stop()
+
+		assert.Equal(t, int32(3), runs.Load(), "original task keeps running on its schedule")
+		assert.Equal(t, int32(0), cancels.Load(), "original task is not cancelled")
+		assert.Len(t, scheduler.ScheduledTasks(), 1)
 	})
 }
