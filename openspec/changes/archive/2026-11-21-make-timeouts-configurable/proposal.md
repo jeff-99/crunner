@@ -34,4 +34,4 @@ Users can't tighten the run timeout for short jobs, give a slow custom schedule 
 - Dependencies on other changes: none.
 - Coordination with other changes:
   - `validate-task-registration` could reject a negative per-task timeout. Here, negative values mean "no timeout", for consistency with the scheduler option.
-  - `fix-mainloop-self-send-deadlock` removes the reliance on buffer size for correctness. Until it lands, a very small queue size makes that deadlock more likely, as noted in the option docs.
+  - `fix-mainloop-self-send-deadlock` (merged) removed the main loop's self-send, so a small queue size no longer risks that deadlock.

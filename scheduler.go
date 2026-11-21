@@ -33,6 +33,30 @@ func WithSummaryInterval(d time.Duration) SchedulerOption {
 	}
 }
 
+// WithTaskTimeout sets the default timeout of every run (default 30 days). A task's own WithTimeout
+// overrides it. A value <= 0 disables the timeout: runs are then only cancelled when the scheduler stops.
+func WithTaskTimeout(d time.Duration) SchedulerOption {
+	return func(o *internalScheduler) {
+		o.taskTimeout = d
+	}
+}
+
+// WithScheduleTimeout bounds each Schedule.Next call (default 1 minute). A value <= 0 disables the
+// timeout: the call's context is then only cancelled when the scheduler stops.
+func WithScheduleTimeout(d time.Duration) SchedulerOption {
+	return func(o *internalScheduler) {
+		o.scheduleTimeout = d
+	}
+}
+
+// WithQueueSize sets the buffer size of the scheduler's internal queues (default 100). Values below 1
+// are clamped to 1.
+func WithQueueSize(n int) SchedulerOption {
+	return func(o *internalScheduler) {
+		o.queueSize = n
+	}
+}
+
 type (
 	SuccessCallback func(ctx context.Context)
 	ErrorCallback   func(ctx context.Context, err error)
@@ -49,6 +73,9 @@ type SchedulingOptions struct {
 	OnSuccess *SuccessCallback
 	OnError   *ErrorCallback
 	OnCancel  *CancelCallback
+
+	// Timeout overrides the scheduler's task timeout for this task; nil inherits it.
+	Timeout *time.Duration
 }
 
 type SchedulingOption func(*SchedulingOptions)
@@ -108,6 +135,14 @@ func WithErrorCallback(f ErrorCallback) SchedulingOption {
 	}
 }
 
+// WithTimeout sets this task's run timeout, overriding the scheduler's WithTaskTimeout.
+// A value <= 0 disables the timeout for this task.
+func WithTimeout(d time.Duration) SchedulingOption {
+	return func(o *SchedulingOptions) {
+		o.Timeout = &d
+	}
+}
+
 func WithCancelCallback(f CancelCallback) SchedulingOption {
 	return func(o *SchedulingOptions) {
 		o.OnCancel = &f
@@ -160,6 +195,9 @@ type internalScheduler struct {
 	loopDone chan struct{}
 
 	summaryInterval time.Duration
+	taskTimeout     time.Duration
+	scheduleTimeout time.Duration
+	queueSize       int
 
 	state atomic.Int32
 }
@@ -203,24 +241,26 @@ type schedulingUnit struct {
 }
 
 func New(opts ...SchedulerOption) Scheduler {
-	// Use buffered channels to prevent blocking
-	const channelBufferSize = 100
-
 	scheduler := &internalScheduler{
 		wg:              &sync.WaitGroup{},
 		tasks:           sync.Map{},
-		newTaskCh:       make(chan *schedulingUnit, channelBufferSize),
-		tasksIn:         make(chan *schedulingUnit, channelBufferSize),
-		doneCh:          make(chan runResult, channelBufferSize),
 		logger:          zerolog.Nop(), // Initialize with Nop logger by default
 		summaryInterval: 30 * time.Second,
+		taskTimeout:     30 * 24 * time.Hour,
+		scheduleTimeout: time.Minute,
+		queueSize:       100,
 	}
 	scheduler.state.Store(stateIdle) // Initialize state
 
-	// Apply options, potentially overwriting the logger
 	for _, opt := range opts {
 		opt(scheduler)
 	}
+
+	// Channels are created after the options so that their buffer size can be configured.
+	scheduler.queueSize = max(scheduler.queueSize, 1)
+	scheduler.newTaskCh = make(chan *schedulingUnit, scheduler.queueSize)
+	scheduler.tasksIn = make(chan *schedulingUnit, scheduler.queueSize)
+	scheduler.doneCh = make(chan runResult, scheduler.queueSize)
 
 	return scheduler
 }
@@ -309,7 +349,7 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, cancelledEnd *tim
 	}
 
 	s.logger.Trace().Str("task", su.ID()).Msg("Scheduling task")
-	ctx, cancel := context.WithTimeout(s.schedulerCtx, 1*time.Minute)
+	ctx, cancel := withOptionalTimeout(s.schedulerCtx, s.scheduleTimeout)
 	defer cancel()
 
 	isBackfill := su.options.Backfill && su.options.NotBefore != nil
@@ -444,7 +484,11 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		defer cancel()
 		var err error
 		func() {
-			taskCtx, taskCancel := context.WithTimeout(ctx, 30*24*time.Hour)
+			timeout := s.taskTimeout
+			if taskUnit.options.Timeout != nil {
+				timeout = *taskUnit.options.Timeout
+			}
+			taskCtx, taskCancel := withOptionalTimeout(ctx, timeout)
 			defer taskCancel()
 			// Recover here, not around the whole goroutine, so the result is still
 			// recorded and the task rescheduled. runtime.Goexit is not a panic and is not handled.
@@ -741,4 +785,12 @@ func (s *internalScheduler) RemoveTask(id string) error {
 	}
 
 	return nil
+}
+
+// withOptionalTimeout derives a context with the given timeout, or without one when timeout <= 0.
+func withOptionalTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
 }

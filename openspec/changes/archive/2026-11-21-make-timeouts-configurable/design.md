@@ -28,10 +28,9 @@ There are three hardcoded values:
   - The task-level option is a pointer so that "unset" (inherit the scheduler value) is different from "0" (disabled).
   - Alternative considered: a zero value meaning "inherit". That would leave no way to disable the timeout for one task.
 - **`<= 0` disables the timeout.** This keeps `New` free of errors. The "disabled" case uses `context.WithCancel` instead of `WithTimeout`.
-- **Clamp the queue size to at least 1.** An unbuffered channel would turn the existing self-send on the main loop (scheduler.go:415) into a guaranteed deadlock. Clamping avoids a footgun without making `New` return an error.
+- **Clamp the queue size to at least 1.** Keeps the internal channels buffered, as they always have been, without making `New` return an error.
 - **Resolve the timeout when the run starts.** `processTask` reads the unit's option or falls back to the scheduler value. Since there is no runtime mutation, no locking is needed.
 
 ## Risks / Trade-offs
 
-- [A small queue size still increases the risk of the main-loop self-send deadlock (finding 3)] → The option doc points to it. `fix-mainloop-self-send-deadlock` removes the risk.
 - [Clamping hides bad input silently] → Documented on the option. The value is trivially inspectable in tests.
