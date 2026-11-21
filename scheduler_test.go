@@ -1061,3 +1061,86 @@ func TestSupersededTaskPendingTimerDoesNotRun(t *testing.T) {
 		})
 	}
 }
+
+func TestConcurrentRegistrationsSameIDCancelDisplacedExactlyOnce(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+
+		const n = 50
+		var runs atomic.Int32
+		cancels := make([]atomic.Int32, n)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				assert.NoError(t, scheduler.RegisterTask(
+					func(ctx context.Context, meta s.TriggerMetadata) error { runs.Add(1); return nil },
+					s.WithIntervalSchedule(time.Second),
+					s.WithID("same"),
+					s.WithCancelCallback(func(ctx context.Context) { cancels[i].Add(1) }),
+				))
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		tickXSeconds(1 * time.Second)
+
+		total := int32(0)
+		for i := range cancels {
+			c := cancels[i].Load()
+			assert.LessOrEqual(t, c, int32(1), "cancel callback %d must fire at most once", i)
+			total += c
+		}
+		assert.Equal(t, int32(n-1), total, "every displaced task is cancelled exactly once")
+		assert.Equal(t, int32(1), runs.Load(), "exactly one registration remains and runs")
+		assert.Len(t, scheduler.ScheduledTasks(), 1)
+
+		scheduler.Stop()
+	})
+}
+
+func TestConcurrentRemoveSameIDSucceedsOnce(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+
+		var cancelled atomic.Int32
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			s.WithIntervalSchedule(time.Second),
+			s.WithID("victim"),
+			s.WithCancelCallback(func(ctx context.Context) { cancelled.Add(1) }),
+		))
+
+		const n = 50
+		var successes atomic.Int32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if scheduler.RemoveTask("victim") == nil {
+					successes.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), successes.Load(), "exactly one RemoveTask succeeds")
+		assert.Equal(t, int32(1), cancelled.Load(), "cancel callback fires exactly once")
+
+		scheduler.Stop()
+	})
+}

@@ -235,44 +235,34 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 		onCancel:  opts.OnCancel,
 	}
 
-	// --- Overwrite Handling ---
-	// Before storing the new unit, check if one already exists with the same ID.
-	// If so, call its cancel callback.
-	if existingValue, loaded := s.tasks.Load(newSchedulingUnit.ID()); loaded {
-		s.logger.Trace().Str("task", newSchedulingUnit.ID()).Msg("Overwriting existing task registration")
-		if existingUnit, ok := existingValue.(*schedulingUnit); ok {
-			// The main loop stops the overwritten unit's timer when it sees the new unit;
-			// a stale timer that fires first is dropped by the main loop's identity check.
-			// Call the cancel callback of the *overwritten* task, if it exists
-			if existingUnit.onCancel != nil {
-				callbackCtx := context.Background() // Use background context for the callback
-				if s.schedulerCtx != nil {
-					// Prefer scheduler context if available, but don't block registration on it
-					// Consider if a derived context with a short timeout is better here.
-					callbackCtx = s.schedulerCtx
-				}
-				s.logger.Trace().Str("task", existingUnit.ID()).Msg("Calling cancel callback for overwritten task")
-				f := *existingUnit.onCancel
-				go f(callbackCtx) // Run in a goroutine to avoid blocking registration
+	// Swap the new unit in atomically; exactly the unit it displaced (if any) is cancelled.
+	id := newSchedulingUnit.ID()
+	if previous, loaded := s.tasks.Swap(id, newSchedulingUnit); loaded {
+		s.logger.Trace().Str("task", id).Msg("Overwriting existing task registration")
+		// The main loop stops the overwritten unit's timer when it sees the new unit;
+		// a stale timer that fires first is dropped by the main loop's identity check.
+		if existingUnit, ok := previous.(*schedulingUnit); ok && existingUnit.onCancel != nil {
+			callbackCtx := context.Background()
+			if s.schedulerCtx != nil {
+				callbackCtx = s.schedulerCtx
 			}
+			s.logger.Trace().Str("task", id).Msg("Calling cancel callback for overwritten task")
+			f := *existingUnit.onCancel
+			go f(callbackCtx) // Run in a goroutine to avoid blocking registration
 		}
 	}
-	// --- End Overwrite Handling ---
-
-	// Store the new or updated scheduling unit.
-	s.tasks.Store(newSchedulingUnit.ID(), newSchedulingUnit)
 
 	// Send the new unit to the main loop for scheduling its *first* run (or rescheduling if Start was already called).
 	// Only send if the scheduler is actually running.
 	if s.state.Load() == stateRunning {
 		select {
 		case <-s.schedulerCtx.Done():
-			s.logger.Warn().Str("task", newSchedulingUnit.ID()).Msg("Scheduler context done, cannot schedule newly registered task")
+			s.logger.Warn().Str("task", id).Msg("Scheduler context done, cannot schedule newly registered task")
 		case s.newTaskCh <- newSchedulingUnit:
-			s.logger.Trace().Str("task", newSchedulingUnit.ID()).Msg("New/overwritten task sent for scheduling")
+			s.logger.Trace().Str("task", id).Msg("New/overwritten task sent for scheduling")
 		}
 	} else {
-		s.logger.Trace().Str("task", newSchedulingUnit.ID()).Msg("Scheduler not running, task registered but not scheduled yet")
+		s.logger.Trace().Str("task", id).Msg("Scheduler not running, task registered but not scheduled yet")
 	}
 
 	return nil
@@ -696,13 +686,12 @@ func (s *internalScheduler) ScheduledTasks() []Task {
 }
 
 func (s *internalScheduler) RemoveTask(id string) error {
-	taskValue, loaded := s.tasks.Load(id)
+	taskValue, loaded := s.tasks.LoadAndDelete(id)
 	if !loaded {
 		return fmt.Errorf("task with id %s not found", id)
 	}
 	su := taskValue.(*schedulingUnit)
 
-	s.tasks.Delete(id)
 	s.logger.Trace().Str("task", id).Msg("Removed task from map")
 
 	// The unit's timer, if still pending, fires once and is dropped by the main loop.
