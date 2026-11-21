@@ -1580,3 +1580,189 @@ func TestRestartAfterLongStopMergesMissedWindows(t *testing.T) {
 		assert.Equal(t, int32(1), cancels.Load())
 	})
 }
+
+// deadlineRecorder records the deadline of each run's context relative to the run start.
+func deadlineRecorder(mu *sync.Mutex, deadlines *[]*time.Duration, block bool) s.Task {
+	return func(ctx context.Context, meta s.TriggerMetadata) error {
+		start := time.Now()
+		var d *time.Duration
+		if dl, ok := ctx.Deadline(); ok {
+			v := dl.Sub(start)
+			d = &v
+		}
+		mu.Lock()
+		*deadlines = append(*deadlines, d)
+		mu.Unlock()
+		if block {
+			<-ctx.Done()
+		}
+		return ctx.Err()
+	}
+}
+
+func TestTaskTimeouts(t *testing.T) {
+	day := 24 * time.Hour
+	tests := map[string]struct {
+		schedulerOpts []s.SchedulerOption
+		taskOpts      []s.SchedulingOption
+		want          *time.Duration
+	}{
+		"default 30 days":       {nil, nil, ptr(30 * day)},
+		"scheduler-wide 5s":     {[]s.SchedulerOption{s.WithTaskTimeout(5 * time.Second)}, nil, ptr(5 * time.Second)},
+		"per-task 1s override":  {[]s.SchedulerOption{s.WithTaskTimeout(5 * time.Second)}, []s.SchedulingOption{s.WithTimeout(time.Second)}, ptr(time.Second)},
+		"scheduler disabled":    {[]s.SchedulerOption{s.WithTaskTimeout(0)}, nil, nil},
+		"per-task disabled":     {[]s.SchedulerOption{s.WithTaskTimeout(5 * time.Second)}, []s.SchedulingOption{s.WithTimeout(0)}, nil},
+		"per-task negative off": {nil, []s.SchedulingOption{s.WithTimeout(-time.Second)}, nil},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				scheduler := s.New(tc.schedulerOpts...)
+				var mu sync.Mutex
+				var deadlines []*time.Duration
+
+				assert.NoError(t, scheduler.Start(t.Context()))
+				opts := append([]s.SchedulingOption{s.WithID("t")}, tc.taskOpts...)
+				assert.NoError(t, scheduler.RegisterTask(deadlineRecorder(&mu, &deadlines, false), s.WithIntervalSchedule(time.Second), opts...))
+
+				tickXSeconds(time.Second)
+				scheduler.Stop()
+
+				mu.Lock()
+				defer mu.Unlock()
+				if assert.Len(t, deadlines, 1) {
+					if tc.want == nil {
+						assert.Nil(t, deadlines[0], "run context must have no deadline")
+					} else if assert.NotNil(t, deadlines[0]) {
+						assert.Equal(t, *tc.want, *deadlines[0])
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestTaskTimeoutCancelsRun(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New(s.WithTaskTimeout(5 * time.Second))
+		var mu sync.Mutex
+		var gotErr error
+		var ended time.Time
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		start := time.Now()
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error {
+				<-ctx.Done()
+				mu.Lock()
+				if ended.IsZero() {
+					ended = time.Now()
+				}
+				mu.Unlock()
+				return ctx.Err()
+			},
+			s.WithIntervalSchedule(time.Second), s.WithID("slow"),
+			s.WithErrorCallback(func(ctx context.Context, err error) {
+				mu.Lock()
+				if gotErr == nil {
+					gotErr = err
+				}
+				mu.Unlock()
+			}),
+		))
+
+		time.Sleep(7 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.ErrorIs(t, gotErr, context.DeadlineExceeded)
+		assert.True(t, start.Add(6*time.Second).Equal(ended), "run (started at 1s) cancelled 5s later, got %s", ended.Sub(start))
+	})
+}
+
+// ctxSchedule records its context deadline and, after its first call, blocks until the context is done.
+type ctxSchedule struct {
+	mu       sync.Mutex
+	calls    int
+	deadline *time.Duration
+}
+
+func (c *ctxSchedule) Next(ctx context.Context, start time.Time, lastRun *time.Time) (time.Time, error) {
+	c.mu.Lock()
+	c.calls++
+	calls := c.calls
+	if dl, ok := ctx.Deadline(); ok && calls == 1 {
+		d := dl.Sub(time.Now())
+		c.deadline = &d
+	}
+	c.mu.Unlock()
+	if calls == 1 {
+		return start.Add(time.Second), nil
+	}
+	<-ctx.Done()
+	return time.Time{}, ctx.Err()
+}
+
+func TestScheduleTimeouts(t *testing.T) {
+	t.Run("default deadline is 1 minute", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := s.New()
+			sch := &ctxSchedule{}
+			assert.NoError(t, scheduler.Start(t.Context()))
+			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil }, sch, s.WithID("t")))
+			synctest.Wait()
+			scheduler.Stop()
+
+			sch.mu.Lock()
+			defer sch.mu.Unlock()
+			if assert.NotNil(t, sch.deadline) {
+				assert.Equal(t, time.Minute, *sch.deadline)
+			}
+		})
+	})
+
+	t.Run("exceeded timeout stops rescheduling", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := s.New(s.WithScheduleTimeout(time.Second))
+			sch := &ctxSchedule{}
+			var runs, canary atomic.Int32
+			assert.NoError(t, scheduler.Start(t.Context()))
+			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { runs.Add(1); return nil }, sch, s.WithID("t")))
+			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { canary.Add(1); return nil },
+				s.WithIntervalSchedule(time.Second), s.WithID("canary")))
+
+			tickXSeconds(10 * time.Second)
+			scheduler.Stop()
+
+			sch.mu.Lock()
+			defer sch.mu.Unlock()
+			assert.Equal(t, int32(1), runs.Load(), "task is not scheduled again after its schedule timed out")
+			assert.Equal(t, 2, sch.calls)
+			assert.GreaterOrEqual(t, canary.Load(), int32(8), "scheduler keeps running other tasks")
+		})
+	})
+
+	t.Run("disabled timeout has no deadline", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			scheduler := s.New(s.WithScheduleTimeout(0))
+			sch := &ctxSchedule{}
+			assert.NoError(t, scheduler.Start(t.Context()))
+			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil }, sch, s.WithID("t")))
+			synctest.Wait()
+			scheduler.Stop()
+
+			sch.mu.Lock()
+			defer sch.mu.Unlock()
+			assert.Nil(t, sch.deadline)
+		})
+	})
+}
+
+func ptr[T any](v T) *T { return &v }
