@@ -249,9 +249,9 @@ func TestStoppingAndStartingScheduler(t *testing.T) {
 
 		tickXSeconds(2 * time.Second)
 
-		// expected five runs and not 4 because when the scheduler started again
-		// the interval was ready to trigger again so it triggers directly and then 2 additional intervals were waited so two additional triggers
-		assert.Equal(t, int32(5), count.Load())
+		// Windows are contiguous: the two windows missed while stopped ([2s,3s) and [3s,4s)) are within
+		// MaxDrift, so both run on restart, followed by [4s,5s) and [5s,6s): 2 + 4 = 6 runs.
+		assert.Equal(t, int32(6), count.Load())
 
 		scheduler.Stop()
 
@@ -899,12 +899,13 @@ func TestMassDriftSkipDoesNotStallScheduler(t *testing.T) {
 
 		var cancelled atomic.Int32
 		var canaryRuns atomic.Int32
+		var lateRuns atomic.Int32
 		schedules := make([]*lateOnceSchedule, lateTasks)
 
 		for i := range lateTasks {
 			schedules[i] = &lateOnceSchedule{}
 			err := scheduler.RegisterTask(
-				func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+				func(ctx context.Context, meta s.TriggerMetadata) error { lateRuns.Add(1); return nil },
 				schedules[i],
 				s.WithID(fmt.Sprintf("late-%d", i)),
 				s.WithMaxDrift(time.Second),
@@ -922,9 +923,10 @@ func TestMassDriftSkipDoesNotStallScheduler(t *testing.T) {
 		scheduler.Start(t.Context())
 		tickXSeconds(5 * time.Second)
 
-		assert.Equal(t, int32(lateTasks), cancelled.Load(), "every late task should be skipped")
+		assert.Equal(t, int32(lateTasks), cancelled.Load(), "every late task should be cancelled")
+		assert.Equal(t, int32(0), lateRuns.Load(), "cancelled runs are not executed")
 		for i, sch := range schedules {
-			assert.Equal(t, int32(2), sch.calls.Load(), "late task %d should be rescheduled once", i)
+			assert.Equal(t, int32(2), sch.calls.Load(), "late task %d should be rescheduled (merged window) once", i)
 		}
 		assert.Equal(t, int32(5), canaryRuns.Load(), "canary task should keep running")
 
@@ -1342,5 +1344,239 @@ func TestRejectedRegistrationLeavesExistingTaskIntact(t *testing.T) {
 		assert.Equal(t, int32(3), runs.Load(), "original task keeps running on its schedule")
 		assert.Equal(t, int32(0), cancels.Load(), "original task is not cancelled")
 		assert.Len(t, scheduler.ScheduledTasks(), 1)
+	})
+}
+
+type recordedWindow struct {
+	start, end, ran time.Time
+}
+
+// windowRecorder records the trigger window and start time of every run.
+type windowRecorder struct {
+	mu   sync.Mutex
+	runs []recordedWindow
+}
+
+func (w *windowRecorder) task(runFor time.Duration) s.Task {
+	return func(ctx context.Context, meta s.TriggerMetadata) error {
+		w.mu.Lock()
+		w.runs = append(w.runs, recordedWindow{meta.TriggerWindowStart, meta.TriggerWindowEnd, time.Now()})
+		w.mu.Unlock()
+		time.Sleep(runFor)
+		return nil
+	}
+}
+
+func (w *windowRecorder) get() []recordedWindow {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]recordedWindow(nil), w.runs...)
+}
+
+func TestFirstWindowOfTaskRegisteredBeforeStartBeginsAtStart(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		var cancels atomic.Int32
+
+		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("idle"),
+			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+
+		time.Sleep(time.Minute)
+		start := time.Now()
+		assert.NoError(t, scheduler.Start(t.Context()))
+		time.Sleep(10*time.Second + time.Millisecond)
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		if assert.Len(t, runs, 1) {
+			assert.True(t, start.Equal(runs[0].start), "window start %s, want Start time %s", runs[0].start, start)
+			assert.True(t, start.Add(10*time.Second).Equal(runs[0].end))
+		}
+		assert.Equal(t, int32(0), cancels.Load(), "first run must not be cancelled")
+	})
+}
+
+func TestWindowsStayOnGridWhenRunsStartLate(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		origin := time.Now()
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		// Each run takes 12s, so every following run starts after its window ended.
+		assert.NoError(t, scheduler.RegisterTask(rec.task(12*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("late")))
+
+		time.Sleep(100*12*time.Second + 20*time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		if assert.GreaterOrEqual(t, len(runs), 100) {
+			for i, r := range runs[:100] {
+				assert.True(t, origin.Add(time.Duration(i)*10*time.Second).Equal(r.start), "window %d start %s", i, r.start.Sub(origin))
+				assert.True(t, origin.Add(time.Duration(i+1)*10*time.Second).Equal(r.end), "window %d end %s", i, r.end.Sub(origin))
+			}
+			assert.True(t, origin.Add(1000*time.Second).Equal(runs[99].end))
+		}
+	})
+}
+
+// recordingSchedule is an interval schedule that records the reference time it is called with.
+type recordingSchedule struct {
+	interval time.Duration
+	mu       sync.Mutex
+	refs     []time.Time
+}
+
+func (r *recordingSchedule) Next(ctx context.Context, start time.Time, lastRun *time.Time) (time.Time, error) {
+	if lastRun == nil {
+		return start.Add(r.interval), nil
+	}
+	r.mu.Lock()
+	r.refs = append(r.refs, *lastRun)
+	r.mu.Unlock()
+	return lastRun.Add(r.interval), nil
+}
+
+func TestScheduleReferenceTimeIsPreviousWindowEnd(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		sch := &recordingSchedule{interval: 10 * time.Second}
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(rec.task(13*time.Second), sch, s.WithID("ref")))
+
+		time.Sleep(60 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		sch.mu.Lock()
+		defer sch.mu.Unlock()
+		assert.GreaterOrEqual(t, len(sch.refs), 3)
+		for i, ref := range sch.refs {
+			if i < len(runs) {
+				assert.True(t, runs[i].end.Equal(ref), "reference %d is %s, want previous window end %s (run started %s)", i, ref, runs[i].end, runs[i].ran)
+			}
+		}
+	})
+}
+
+func TestLongRunningTaskIsNotCancelled(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		var cancels atomic.Int32
+		origin := time.Now()
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(rec.task(25*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("slow"),
+			s.WithMaxDrift(time.Second),
+			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+
+		time.Sleep(36 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		assert.Equal(t, int32(0), cancels.Load(), "a long run must not cancel its successor")
+		if assert.Len(t, runs, 2) {
+			assert.True(t, origin.Add(10*time.Second).Equal(runs[1].start), "second window starts at the first window's end")
+			assert.True(t, origin.Add(20*time.Second).Equal(runs[1].end), "second window spans one interval")
+			assert.True(t, origin.Add(35*time.Second).Equal(runs[1].ran), "second run starts right after the first finishes (10s + 25s)")
+		}
+	})
+}
+
+// blockingOnceSchedule fires once after `first`; computing its next run blocks the main loop for `block`.
+type blockingOnceSchedule struct {
+	first, block time.Duration
+}
+
+func (b blockingOnceSchedule) Next(ctx context.Context, start time.Time, lastRun *time.Time) (time.Time, error) {
+	if lastRun == nil {
+		return start.Add(b.first), nil
+	}
+	time.Sleep(b.block)
+	return start.Add(24 * time.Hour), nil
+}
+
+func TestLateRunIsCancelledAndMergedIntoNextWindow(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		var cancels atomic.Int32
+		origin := time.Now()
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("task"),
+			s.WithMaxDrift(5*time.Second),
+			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+		// Runs at 19s; rescheduling it blocks the main loop until 27s, so the task's 20s timer is handled at 27s.
+		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil },
+			blockingOnceSchedule{first: 19 * time.Second, block: 8 * time.Second}, s.WithID("blocker"), s.WithMaxDrift(time.Hour)))
+
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		assert.Equal(t, int32(1), cancels.Load(), "late run is cancelled once")
+		assert.Len(t, rec.get(), 1, "no run is executed at 27s")
+
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		if assert.Len(t, runs, 2) {
+			assert.True(t, origin.Add(10*time.Second).Equal(runs[1].start), "merged window starts at the cancelled window's start, got %s", runs[1].start.Sub(origin))
+			assert.True(t, origin.Add(30*time.Second).Equal(runs[1].end), "merged window ends at the next grid point, got %s", runs[1].end.Sub(origin))
+			assert.True(t, origin.Add(30*time.Second).Equal(runs[1].ran), "merged run fires at its normal time, got %s", runs[1].ran.Sub(origin))
+		}
+		assert.Equal(t, int32(1), cancels.Load())
+	})
+}
+
+func TestRestartAfterLongStopMergesMissedWindows(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		var cancels atomic.Int32
+		origin := time.Now()
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("task"),
+			s.WithMaxDrift(5*time.Second),
+			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+
+		time.Sleep(15 * time.Second)
+		assert.NoError(t, scheduler.Stop())
+		time.Sleep(68 * time.Second) // now 83s
+		assert.NoError(t, scheduler.Start(t.Context()))
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), cancels.Load(), "pending window is cancelled once on restart")
+		assert.Len(t, rec.get(), 1, "no run at 83s")
+
+		time.Sleep(17*time.Second + time.Millisecond) // now 100s
+		synctest.Wait()
+		scheduler.Stop()
+
+		runs := rec.get()
+		if assert.Len(t, runs, 3) {
+			assert.True(t, origin.Add(10*time.Second).Equal(runs[1].start), "got %s", runs[1].start.Sub(origin))
+			assert.True(t, origin.Add(90*time.Second).Equal(runs[1].end), "got %s", runs[1].end.Sub(origin))
+			assert.True(t, origin.Add(90*time.Second).Equal(runs[1].ran), "got %s", runs[1].ran.Sub(origin))
+			assert.True(t, origin.Add(90*time.Second).Equal(runs[2].start))
+			assert.True(t, origin.Add(100*time.Second).Equal(runs[2].end))
+		}
+		assert.Equal(t, int32(1), cancels.Load())
 	})
 }

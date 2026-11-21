@@ -7,7 +7,7 @@ Defines how the next run time of a task is computed, through a pluggable schedul
 ## Requirements
 
 ### Requirement: Pluggable schedules
-The library SHALL accept any schedule that, given a scheduling start time and an optional last run time, returns the next run time or an error.
+The library SHALL accept any schedule that, given a scheduling start time and an optional reference time, returns the next run time or an error. The reference time SHALL be a previous point of the task's window sequence — normally the end of the task's previous trigger window — and never the actual start of a run. It is absent for the first window.
 
 #### Scenario: Custom schedule
 - **WHEN** a task is registered with a user-defined schedule
@@ -17,16 +17,20 @@ The library SHALL accept any schedule that, given a scheduling start time and an
 - **WHEN** a schedule returns an error while computing the next run
 - **THEN** the error is logged and the task is not scheduled again
 
+#### Scenario: Reference time is the previous window end
+- **WHEN** a custom schedule is asked for the next run of a task whose previous window ended at T and whose run started at T+3s
+- **THEN** the reference time passed to the schedule is T
+
 ### Requirement: Interval schedule
-The library SHALL provide an interval schedule whose next run is the last run time plus the interval, or the scheduling start plus the interval when the task has not run yet.
+The library SHALL provide an interval schedule whose next run is the reference time plus the interval, or the scheduling start plus the interval when there is no reference time.
 
 #### Scenario: First interval run
 - **WHEN** an interval task has not run yet
 - **THEN** its next run is the scheduling start plus the interval
 
 #### Scenario: Subsequent interval run
-- **WHEN** an interval task has run before
-- **THEN** its next run is its last run start time plus the interval
+- **WHEN** an interval task has a previous window
+- **THEN** its next run is that window's end plus the interval, regardless of when the previous run started
 
 ### Requirement: Cron schedule
 The library SHALL provide a cron schedule built from a standard 5-field cron expression or, optionally, a 6-field expression with seconds, including `@` descriptors, evaluated in a given time zone. When no time zone is given (nil), the local time zone SHALL be used. Every next-run computation, including the first run of a task, SHALL evaluate the expression in that time zone. A `CRON_TZ=` or `TZ=` prefix in the expression SHALL take precedence over the given time zone.
