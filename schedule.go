@@ -39,6 +39,10 @@ func WithCronSchedule(spec string, location *time.Location, includeSeconds bool)
 		return cronSchedule{}, err
 	}
 
+	if location == nil {
+		location = time.Local
+	}
+
 	return cronSchedule{
 		Spec:     spec,
 		Location: location,
@@ -47,11 +51,17 @@ func WithCronSchedule(spec string, location *time.Location, includeSeconds bool)
 }
 
 func (c cronSchedule) Next(ctx context.Context, now time.Time, lastRun *time.Time) (time.Time, error) {
-	if lastRun != nil {
-		return c.schedule.Next((*lastRun).In(c.Location)), nil
+	location := c.Location
+	if location == nil {
+		location = time.Local
 	}
 
-	return c.schedule.Next(now), nil
+	base := now
+	if lastRun != nil {
+		base = *lastRun
+	}
+
+	return c.schedule.Next(base.In(location)), nil
 }
 
 type intervalSchedule struct {
