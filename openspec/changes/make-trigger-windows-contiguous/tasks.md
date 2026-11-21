@@ -3,7 +3,7 @@
 - [ ] 1.1 Remove `schedulingEpoch` from `internalScheduler` and `Start`; verify `go build ./...`
 - [ ] 1.2 Add a window origin recorded when a unit is first scheduled while running (registration on a running scheduler or `Start`) and a `coveredUntil` per unit (initially the origin, or NotBefore when backfilling); start every window at `coveredUntil`; verify with test 3.1
 - [ ] 1.3 In `scheduleTask`, always pass the previous window end (or nil for the first window) to `Schedule.Next`, removing the `LastRunTime` branch; advance `coveredUntil` when a run's result is handled; verify with tests 3.2 and 3.3
-- [ ] 1.4 Update `Schedule` and `intervalSchedule` doc comments in `schedule.go` (reference time is a previous window end, never a run start) and the `TriggerMetadata` doc (a window can span more than one interval); verify by reading `go doc`
+- [ ] 1.4 Update `Schedule` and `intervalSchedule` doc comments in `schedule.go` (reference time is a previous window end, never a run start) the `TriggerMetadata` doc (a window can span more than one interval) and the `WithMaxDrift` doc (a cancelled run's work waits for the next scheduled point, up to one interval); verify by reading `go doc`
 
 ## 2. Expected trigger time and drift
 

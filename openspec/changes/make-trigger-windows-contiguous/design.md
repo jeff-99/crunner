@@ -31,5 +31,6 @@
 - [Windows wider than one interval after a cancellation] → Documented on `TriggerMetadata`; tasks must use `TriggerWindowStart/End`, not assume the interval.
 - [A task that is consistently slower than its interval falls further behind forever, running back-to-back] → Accepted; visible via window timestamps. `add-overlap-policy` adds skip/reschedule policies.
 - [Finding the merged window end calls `Schedule.Next` once per elapsed step on the main loop (e.g. 1ms interval after a 1h pause ≈ 3.6M calls)] → Accepted for now; no cap.
+- [A cancelled run's work waits for the next point of the schedule: for long intervals (e.g. a daily cron after a 31s hiccup with default MaxDrift) that is up to one interval later] → Accepted and documented on `WithMaxDrift`; long-interval tasks should use a larger MaxDrift. A per-task "run now" alternative can be added with `add-overlap-policy`.
 - [The callback is still called "cancel" and receives no window info] → `split-cancel-callback` renames it and passes the cancelled window.
 - [Existing drift tests assume the old skip semantics] → Updated as part of this change.
