@@ -1409,8 +1409,10 @@ func TestWindowsStayOnGridWhenRunsStartLate(t *testing.T) {
 		origin := time.Now()
 
 		assert.NoError(t, scheduler.Start(t.Context()))
-		// Each run takes 12s, so every following run starts after its window ended.
-		assert.NoError(t, scheduler.RegisterTask(rec.task(12*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("late")))
+		// Each run takes 12s, so every following run starts after its window ended. MaxDrift is large enough that the
+		// accumulating lag never causes a skip.
+		assert.NoError(t, scheduler.RegisterTask(rec.task(12*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("late"),
+			s.WithMaxDrift(24*time.Hour)))
 
 		time.Sleep(100*12*time.Second + 20*time.Second)
 		synctest.Wait()
@@ -1470,29 +1472,38 @@ func TestScheduleReferenceTimeIsPreviousWindowEnd(t *testing.T) {
 	})
 }
 
-func TestLongRunningTaskIsNotCancelled(t *testing.T) {
+func TestOverrunBeyondMaxDriftIsSkippedAndMerged(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		scheduler := s.New()
 		rec := &windowRecorder{}
-		var cancels atomic.Int32
+		var mu sync.Mutex
+		var skipTimes []time.Duration
 		origin := time.Now()
 
 		assert.NoError(t, scheduler.Start(t.Context()))
 		assert.NoError(t, scheduler.RegisterTask(rec.task(25*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("slow"),
 			s.WithMaxDrift(time.Second),
-			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
+			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) {
+				mu.Lock()
+				defer mu.Unlock()
+				skipTimes = append(skipTimes, time.Since(origin))
+			})))
 
-		time.Sleep(36 * time.Second)
+		time.Sleep(41 * time.Second)
 		synctest.Wait()
 		scheduler.Stop()
 
 		runs := rec.get()
-		assert.Equal(t, int32(0), cancels.Load(), "a long run must not cancel its successor")
+		mu.Lock()
+		defer mu.Unlock()
+		// The first run (window [0s,10s)) starts at 10s and ends at 35s. The run for window [10s,20s) would start
+		// 15s late, which exceeds MaxDrift, so it is skipped and merged into the window ending at the next grid point.
+		assert.Equal(t, []time.Duration{35 * time.Second}, skipTimes, "one skip, decided when the long run returns")
 		if assert.Len(t, runs, 2) {
-			assert.True(t, origin.Add(10*time.Second).Equal(runs[1].start), "second window starts at the first window's end")
-			assert.True(t, origin.Add(20*time.Second).Equal(runs[1].end), "second window spans one interval")
-			assert.True(t, origin.Add(35*time.Second).Equal(runs[1].ran), "second run starts right after the first finishes (10s + 25s)")
+			assert.True(t, origin.Add(10*time.Second).Equal(runs[1].start), "merged window starts at the skipped window's start")
+			assert.True(t, origin.Add(40*time.Second).Equal(runs[1].end), "merged window ends at the next grid point after the skip")
+			assert.True(t, origin.Add(40*time.Second).Equal(runs[1].ran), "merged run fires at its grid time")
 		}
 	})
 }
@@ -1869,5 +1880,64 @@ func TestRemovingOrReplacingTaskDoesNotCallSkipCallback(t *testing.T) {
 
 		assert.Equal(t, int32(2), removed.Load(), "replacement and removal each call the removed callback once")
 		assert.Equal(t, int32(0), skips.Load(), "replacement and removal must not call the skip callback")
+	})
+}
+
+func TestDriftIsMeasuredFromWindowEnd(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		origin := time.Now()
+		at := func() time.Duration { return time.Since(origin) }
+		durs := []time.Duration{7500 * time.Millisecond, 12500 * time.Millisecond, time.Second, 19 * time.Second}
+		type run struct{ start, windowStart, windowEnd time.Duration }
+		var mu sync.Mutex
+		var runs []run
+		var skips []s.TriggerMetadata
+		var skipTimes []time.Duration
+		next := 0
+
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error {
+				mu.Lock()
+				d := durs[next%len(durs)]
+				next++
+				runs = append(runs, run{at(), meta.TriggerWindowStart.Sub(origin), meta.TriggerWindowEnd.Sub(origin)})
+				mu.Unlock()
+				time.Sleep(d)
+				return nil
+			},
+			s.WithIntervalSchedule(10*time.Second), s.WithID("t"), s.WithMaxDrift(5*time.Second),
+			s.WithSkipCallback(func(ctx context.Context, meta s.TriggerMetadata) {
+				mu.Lock()
+				defer mu.Unlock()
+				skips = append(skips, meta)
+				skipTimes = append(skipTimes, at())
+			}),
+		))
+
+		time.Sleep(61 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		// 7.5s run at 10s; 12.5s run at 20s; window [20s,30s) is 2.5s late (within MaxDrift) and starts at 32.5s;
+		// 1s run; 19s run at 40s ends at 59s; window [40s,50s) is 9s late and is skipped.
+		want := []run{
+			{10 * time.Second, 0, 10 * time.Second},
+			{20 * time.Second, 10 * time.Second, 20 * time.Second},
+			{32500 * time.Millisecond, 20 * time.Second, 30 * time.Second},
+			{40 * time.Second, 30 * time.Second, 40 * time.Second},
+			{60 * time.Second, 40 * time.Second, 60 * time.Second},
+		}
+		assert.Equal(t, want, runs)
+		if assert.Len(t, skips, 1, "exactly one skip callback") {
+			assert.Equal(t, 59*time.Second, skipTimes[0])
+			assert.Equal(t, 40*time.Second, skips[0].TriggerWindowStart.Sub(origin))
+			assert.Equal(t, 50*time.Second, skips[0].TriggerWindowEnd.Sub(origin))
+			assert.Equal(t, 50*time.Second, skips[0].ExpectedTriggerTime.Sub(origin))
+		}
 	})
 }
