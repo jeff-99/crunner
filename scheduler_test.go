@@ -1766,3 +1766,38 @@ func TestScheduleTimeouts(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestEmptyIDTaskRuns(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var runs atomic.Int32
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { runs.Add(1); return nil },
+			s.WithIntervalSchedule(time.Second), s.WithID("")))
+
+		tickXSeconds(3 * time.Second)
+		scheduler.Stop()
+
+		assert.Equal(t, int32(3), runs.Load())
+		assert.Len(t, scheduler.ScheduledTasks(), 1)
+	})
+}
+
+func TestTasksWithoutIDDoNotReplaceEachOther(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var a, b atomic.Int32
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { a.Add(1); return nil }, s.WithIntervalSchedule(time.Second)))
+		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { b.Add(1); return nil }, s.WithIntervalSchedule(time.Second)))
+
+		tickXSeconds(3 * time.Second)
+		scheduler.Stop()
+
+		assert.Equal(t, int32(3), a.Load())
+		assert.Equal(t, int32(3), b.Load())
+		assert.Len(t, scheduler.ScheduledTasks(), 2)
+	})
+}
