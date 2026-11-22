@@ -17,9 +17,10 @@
 
 ### Modified Capabilities
 - `task-registration`: the "Listing tasks" requirement now returns task info snapshots instead of task functions.
+- `scheduler-lifecycle`: the "Concurrency safety" requirement also covers Start and Stop and the scheduler context. A test that inspects tasks while the scheduler is repeatedly started and stopped found that Start wrote the scheduler context while timers left over from the previous run, `RegisterTask`, `RemoveTask` and `Stop` read it.
 
 ## Impact
 
-- Code: `scheduler.go` (`Scheduler` interface, `ScheduledTasks`, new `Task` method, new `TaskInfo` type, state published by the main loop), tests in `scheduler_test.go`.
+- Code: `scheduler.go` (scheduler context held in an atomic pointer and `Start`/`Stop` serialised by a mutex, `Scheduler` interface, `ScheduledTasks`, new `Task` method, new `TaskInfo` type, state published by the main loop), tests in `scheduler_test.go`.
 - API: **BREAKING** — return type of `ScheduledTasks()` changes; `Scheduler` gains a method (breaks external implementations of the interface).
 - Dependencies: none outstanding (`fix-shared-state-races` is merged: the main loop owns task state). Tags are not part of this change; `add-task-tags` adds a `Tags` field to `TaskInfo` when it lands. Skipped-run counters are left for a follow-up.

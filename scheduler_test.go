@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1940,4 +1942,243 @@ func TestDriftIsMeasuredFromWindowEnd(t *testing.T) {
 			assert.Equal(t, 50*time.Second, skips[0].ExpectedTriggerTime.Sub(origin))
 		}
 	})
+}
+
+func TestTaskInspectionLifecycle(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		origin := time.Now()
+		rel := func(ts time.Time) time.Duration { return ts.Sub(origin) }
+
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { time.Sleep(5 * time.Second); return nil },
+			s.WithIntervalSchedule(10*time.Second), s.WithID("job")))
+
+		info, ok := scheduler.Task("job")
+		assert.True(t, ok)
+		assert.Equal(t, "job", info.ID)
+		assert.True(t, info.NextRunTime.IsZero(), "not scheduled before Start")
+		assert.Zero(t, info.Count)
+		assert.False(t, info.Running)
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		synctest.Wait()
+		info, _ = scheduler.Task("job")
+		assert.Equal(t, 10*time.Second, rel(info.NextRunTime), "waiting for the first window to end")
+		assert.Equal(t, time.Duration(0), rel(info.WindowStart))
+		assert.Equal(t, 10*time.Second, rel(info.WindowEnd))
+		assert.False(t, info.Running)
+
+		time.Sleep(12 * time.Second) // 12s: run in progress (10s-15s)
+		synctest.Wait()
+		info, _ = scheduler.Task("job")
+		assert.True(t, info.Running)
+		assert.True(t, info.NextRunTime.IsZero(), "next run unknown while running")
+		assert.Equal(t, 10*time.Second, rel(info.WindowEnd), "window of the executing run")
+		assert.Zero(t, info.Count, "run not finished yet")
+
+		time.Sleep(4 * time.Second) // 16s: finished
+		synctest.Wait()
+		info, _ = scheduler.Task("job")
+		assert.False(t, info.Running)
+		assert.Equal(t, 1, info.Count)
+		assert.Equal(t, 1, info.SuccessfulCount)
+		assert.Equal(t, 0, info.ErrorCount)
+		assert.Equal(t, 10*time.Second, rel(info.LastRunTime))
+		assert.Equal(t, 10*time.Second, rel(info.LastSuccessfulRunTime))
+		assert.True(t, info.LastErroredRunTime.IsZero())
+		assert.Equal(t, 20*time.Second, rel(info.NextRunTime))
+		assert.Equal(t, 10*time.Second, rel(info.WindowStart))
+		assert.Equal(t, 20*time.Second, rel(info.WindowEnd))
+
+		scheduler.Stop()
+		info, _ = scheduler.Task("job")
+		assert.True(t, info.NextRunTime.IsZero(), "nothing pending after Stop")
+		assert.False(t, info.Running)
+		assert.Equal(t, 1, info.Count, "counts are kept")
+	})
+}
+
+func TestTaskInspectionUnknownTask(t *testing.T) {
+	t.Parallel()
+	scheduler := s.New()
+	info, ok := scheduler.Task("nope")
+	assert.False(t, ok)
+	assert.Equal(t, s.TaskInfo{}, info)
+}
+
+func TestTaskInspectionErroredRun(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		origin := time.Now()
+		boom := errors.New("boom")
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return boom },
+			s.WithIntervalSchedule(10*time.Second), s.WithID("failing")))
+
+		time.Sleep(11 * time.Second)
+		synctest.Wait()
+		info, _ := scheduler.Task("failing")
+		assert.Equal(t, 1, info.Count)
+		assert.Equal(t, 1, info.ErrorCount)
+		assert.Equal(t, 0, info.SuccessfulCount)
+		assert.Equal(t, boom, info.LastError)
+		assert.Equal(t, 10*time.Second, info.LastErroredRunTime.Sub(origin))
+		assert.True(t, info.LastSuccessfulRunTime.IsZero())
+		scheduler.Stop()
+	})
+}
+
+func TestTaskInspectionScheduleError(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			errorSchedule{}, s.WithID("broken")))
+		synctest.Wait()
+
+		info, ok := scheduler.Task("broken")
+		assert.True(t, ok)
+		assert.True(t, info.NextRunTime.IsZero(), "a task whose schedule fails has no next run")
+		scheduler.Stop()
+	})
+}
+
+func TestScheduledTasksAreSortedAndIncludeGeneratedIDs(t *testing.T) {
+	t.Parallel()
+	scheduler := s.New()
+	okTask := func(ctx context.Context, meta s.TriggerMetadata) error { return nil }
+	for _, id := range []string{"charlie", "alpha", "bravo"} {
+		assert.NoError(t, scheduler.RegisterTask(okTask, s.WithIntervalSchedule(time.Second), s.WithID(id)))
+	}
+	assert.NoError(t, scheduler.RegisterTask(okTask, s.WithIntervalSchedule(time.Second)))
+
+	infos := scheduler.ScheduledTasks()
+	if assert.Len(t, infos, 4) {
+		ids := make([]string, len(infos))
+		for i, info := range infos {
+			ids[i] = info.ID
+		}
+		assert.True(t, sort.StringsAreSorted(ids), "ordered by ID: %v", ids)
+		generated := ids[len(ids)-1] // "task-..." sorts after "charlie"
+		assert.True(t, strings.HasPrefix(generated, "task-"))
+
+		info, ok := scheduler.Task(generated)
+		assert.True(t, ok, "a generated ID can be used for lookup")
+		assert.Equal(t, generated, info.ID)
+		assert.NoError(t, scheduler.RemoveTask(generated), "and for removal")
+		assert.Len(t, scheduler.ScheduledTasks(), 3)
+	}
+}
+
+func TestTaskInfoSnapshotIsIsolated(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(
+			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
+			s.WithIntervalSchedule(10*time.Second), s.WithID("job")))
+
+		time.Sleep(11 * time.Second)
+		synctest.Wait()
+		first, _ := scheduler.Task("job")
+		assert.Equal(t, 1, first.Count)
+
+		first.Count = 99 // mutating a snapshot must not affect the scheduler
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		second, _ := scheduler.Task("job")
+		assert.Equal(t, 2, second.Count)
+		assert.Equal(t, 99, first.Count, "an earlier snapshot is unchanged by later runs")
+		scheduler.Stop()
+	})
+}
+
+func TestTaskInspectionIsRaceFreeDuringStartStopAndRuns(t *testing.T) {
+	scheduler := s.New()
+	okTask := func(ctx context.Context, meta s.TriggerMetadata) error { return nil }
+	for i := range 5 {
+		assert.NoError(t, scheduler.RegisterTask(okTask, s.WithIntervalSchedule(time.Millisecond), s.WithID(fmt.Sprintf("t%d", i))))
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, info := range scheduler.ScheduledTasks() {
+					_ = info.Count + info.ErrorCount
+				}
+				_, _ = scheduler.Task("t0")
+			}
+		}()
+	}
+
+	for range 5 {
+		assert.NoError(t, scheduler.Start(t.Context()))
+		time.Sleep(30 * time.Millisecond)
+		assert.NoError(t, scheduler.Stop())
+	}
+	close(stop)
+	wg.Wait()
+}
+
+func TestStartStopRegisterRemoveAreRaceFree(t *testing.T) {
+	scheduler := s.New()
+	okTask := func(ctx context.Context, meta s.TriggerMetadata) error { return nil }
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for g := range 2 { // concurrent lifecycle callers; errors for "already running/stopped" are expected
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = scheduler.Start(context.Background())
+				time.Sleep(time.Duration(g+1) * time.Millisecond)
+				_ = scheduler.Stop()
+			}
+		}()
+	}
+	for g := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := fmt.Sprintf("r%d-%d", g, i%3)
+				_ = scheduler.RegisterTask(okTask, s.WithIntervalSchedule(time.Millisecond), s.WithID(id),
+					s.WithRemovedCallback(func(context.Context) {}))
+				_ = scheduler.RemoveTask(id)
+			}
+		}()
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	assert.NoError(t, scheduler.Stop())
 }

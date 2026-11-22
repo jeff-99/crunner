@@ -20,6 +20,8 @@ Task state lives in `schedulingUnit.meta` plus the pending `timer`, and is owned
 - **Ordering**: `ScheduledTasks` sorts by ID for deterministic output (the registry range order is random). A listing is a set of per-task snapshots, not one atomic view of all tasks.
 - **Generated IDs become discoverable** through `ScheduledTasks`, closing the gap left by `require-stable-task-ids`.
 
+- **Race-free Start/Stop (found while testing inspection).** `Start` assigned `s.schedulerCtx`/`s.cancelCtx` while timer callbacks from a previous run, `RegisterTask`, `RemoveTask` and `Stop` read them, and `Stop` could read a nil cancel function in the middle of `Start`. The context and its cancel function now live in one `atomic.Pointer[runState]` that is published before the running state; `Start` and `Stop` are serialised by a `lifecycleMu` mutex so they never interleave; the main loop and timer callbacks capture the context on the main loop instead of re-reading the field. A timer that fires after a restart now sees the cancelled context of its own run and is dropped.
+
 ## Risks / Trade-offs
 
 - [A snapshot can lag the true state by one state change] → Each snapshot is internally consistent and replaced atomically; the lag is bounded by the main loop's processing of a single message.
