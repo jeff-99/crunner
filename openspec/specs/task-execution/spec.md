@@ -14,7 +14,7 @@ Each task invocation SHALL receive a context and a snapshot of its trigger metad
 - **THEN** the metadata contains the window start and end that this run covers
 
 ### Requirement: Trigger windows
-The windows of a task SHALL be contiguous and non-overlapping: each window SHALL start exactly at the end of the task's previous executed window, and its end SHALL be a point of the schedule's sequence computed from the previous window's end, independent of when runs actually started or finished. The first window SHALL start when the task is first scheduled — at registration on a running scheduler, at Start for a task registered while the scheduler was idle — or at NotBefore when backfilling. A window normally spans one step of the schedule; after a run is cancelled for drift, the next window spans several steps (see Maximum drift). Window starts and ends SHALL always be points of the schedule's sequence.
+The windows of a task SHALL be contiguous and non-overlapping: each window SHALL start exactly at the end of the task's previous executed window, and its end SHALL be a point of the schedule's sequence computed from the previous window's end, independent of when runs actually started or finished. The first window SHALL start when the task is first scheduled — at registration on a running scheduler, at Start for a task registered while the scheduler was idle — or at NotBefore when backfilling. A window normally spans one step of the schedule; after a run is skipped for drift, the next window spans several steps (see Drift skipping). Window starts and ends SHALL always be points of the schedule's sequence.
 
 #### Scenario: First window
 - **WHEN** a task without backfill is registered on a running scheduler and runs for the first time
@@ -22,7 +22,7 @@ The windows of a task SHALL be contiguous and non-overlapping: each window SHALL
 
 #### Scenario: First window of a task registered before Start
 - **WHEN** an interval task of 10 seconds is registered on an idle scheduler and the scheduler is started 1 minute later
-- **THEN** its first window starts at the Start time and ends 10 seconds later, and the run is not cancelled
+- **THEN** its first window starts at the Start time and ends 10 seconds later, and the run is not skipped
 
 #### Scenario: Late start does not shift windows
 - **WHEN** an interval task of 10 seconds with window [T, T+10s) starts its run 2 seconds late
