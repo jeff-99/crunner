@@ -8,7 +8,7 @@
 - One scheduler-wide limit with wait/skip modes; zero cost when unset.
 
 **Non-Goals:**
-- Per-task concurrency (a task never overlaps itself; see `add-overlap-policy`).
+- Per-task concurrency: a task never overlaps itself; what happens to a trigger that falls due during a run is governed by MaxDrift (skip or run back to back).
 - Priorities or per-tag limits.
 - Distributed limits across replicas (`add-distributed-locking`).
 
