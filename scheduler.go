@@ -99,6 +99,13 @@ func WithDefaultOptions() SchedulingOptions {
 // run, so a task whose runs overrun its interval by more than MaxDrift is skipped now and then; raise
 // MaxDrift for tasks that may overrun. For long intervals (e.g. a daily cron) a skipped run's work waits
 // up to one interval.
+//
+// MaxDrift is also how a task chooses what happens when a run is still executing at its next trigger.
+// To tolerate a short overrun, use a generous MaxDrift: the next run then starts as soon as the previous
+// one returns. To skip instead ("skip if busy"), use a small MaxDrift such as 1s: an overrun beyond it
+// skips the late run and merges its window into the next one. Register WithSkipCallback to be told, or
+// leave it out to skip silently. Avoid values close to 0, because ordinary timer jitter would then skip
+// runs that were not overrunning.
 func WithMaxDrift(d time.Duration) SchedulingOption {
 	return func(o *SchedulingOptions) {
 		o.MaxDrift = d
