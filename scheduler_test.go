@@ -755,7 +755,7 @@ func TestRemoveTaskRepeatedly(t *testing.T) {
 	})
 }
 
-func TestRemoveTaskCancelCallback(t *testing.T) {
+func TestRemoveTaskRemovedCallback(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		scheduler := s.New()
@@ -779,7 +779,7 @@ func TestRemoveTaskCancelCallback(t *testing.T) {
 			task,
 			s.WithIntervalSchedule(1*time.Second),
 			s.WithID(taskID),
-			s.WithCancelCallback(cancelCallback),
+			s.WithRemovedCallback(cancelCallback),
 		)
 		assert.NoError(t, err, "RegisterTask should succeed")
 
@@ -807,7 +807,7 @@ func TestRemoveTaskCancelCallback(t *testing.T) {
 	})
 }
 
-func TestOverwriteTaskCancelCallback(t *testing.T) {
+func TestOverwriteTaskRemovedCallback(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		scheduler := s.New()
@@ -840,7 +840,7 @@ func TestOverwriteTaskCancelCallback(t *testing.T) {
 			task1,
 			s.WithIntervalSchedule(1*time.Second),
 			s.WithID(taskID),
-			s.WithCancelCallback(cancelCallback1), // Add cancel callback here
+			s.WithRemovedCallback(cancelCallback1), // Add cancel callback here
 		)
 		assert.NoError(t, err, "RegisterTask 1 should succeed")
 
@@ -909,7 +909,7 @@ func TestMassDriftSkipDoesNotStallScheduler(t *testing.T) {
 				schedules[i],
 				s.WithID(fmt.Sprintf("late-%d", i)),
 				s.WithMaxDrift(time.Second),
-				s.WithCancelCallback(func(ctx context.Context) { cancelled.Add(1) }),
+				s.WithSkipCallback(func(ctx context.Context, _ s.TriggerMetadata) { cancelled.Add(1) }),
 			)
 			assert.NoError(t, err)
 		}
@@ -948,7 +948,7 @@ func TestBlockingDriftSkipCallbackDoesNotBlockOtherTasks(t *testing.T) {
 			sch,
 			s.WithID("late"),
 			s.WithMaxDrift(time.Second),
-			s.WithCancelCallback(func(ctx context.Context) {
+			s.WithSkipCallback(func(ctx context.Context, _ s.TriggerMetadata) {
 				<-release
 				close(callbackReturned)
 			}),
@@ -1065,7 +1065,7 @@ func TestSupersededTaskPendingTimerDoesNotRun(t *testing.T) {
 	}
 }
 
-func TestConcurrentRegistrationsSameIDCancelDisplacedExactlyOnce(t *testing.T) {
+func TestConcurrentRegistrationsSameIDRemoveDisplacedExactlyOnce(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		scheduler := s.New()
@@ -1086,7 +1086,7 @@ func TestConcurrentRegistrationsSameIDCancelDisplacedExactlyOnce(t *testing.T) {
 					func(ctx context.Context, meta s.TriggerMetadata) error { runs.Add(1); return nil },
 					s.WithIntervalSchedule(time.Second),
 					s.WithID("same"),
-					s.WithCancelCallback(func(ctx context.Context) { cancels[i].Add(1) }),
+					s.WithRemovedCallback(func(ctx context.Context) { cancels[i].Add(1) }),
 				))
 			}()
 		}
@@ -1120,7 +1120,7 @@ func TestConcurrentRemoveSameIDSucceedsOnce(t *testing.T) {
 			func(ctx context.Context, meta s.TriggerMetadata) error { return nil },
 			s.WithIntervalSchedule(time.Second),
 			s.WithID("victim"),
-			s.WithCancelCallback(func(ctx context.Context) { cancelled.Add(1) }),
+			s.WithRemovedCallback(func(ctx context.Context) { cancelled.Add(1) }),
 		))
 
 		const n = 50
@@ -1257,7 +1257,8 @@ func TestRegisterTaskValidation(t *testing.T) {
 	now := time.Now()
 	var nilSuccess s.SuccessCallback
 	var nilError s.ErrorCallback
-	var nilCancel s.CancelCallback
+	var nilRemoved s.RemovedCallback
+	var nilSkip s.SkipCallback
 
 	tests := map[string]struct {
 		task     s.Task
@@ -1276,7 +1277,8 @@ func TestRegisterTaskValidation(t *testing.T) {
 		"backfill without not before": {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithBackfill()}, []error{s.ErrInvalidOption}},
 		"nil success callback":        {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithSuccessCallback(nilSuccess)}, []error{s.ErrInvalidOption}},
 		"nil error callback":          {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithErrorCallback(nilError)}, []error{s.ErrInvalidOption}},
-		"nil cancel callback":         {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithCancelCallback(nilCancel)}, []error{s.ErrInvalidOption}},
+		"nil skip callback":           {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithSkipCallback(nilSkip)}, []error{s.ErrInvalidOption}},
+		"nil removed callback":        {okTask, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithRemovedCallback(nilRemoved)}, []error{s.ErrInvalidOption}},
 		"multiple problems":           {nil, s.WithIntervalSchedule(time.Second), []s.SchedulingOption{s.WithMaxDrift(-time.Second)}, []error{s.ErrInvalidTask, s.ErrInvalidOption}},
 		"all three kinds":             {nil, nil, []s.SchedulingOption{s.WithMaxDrift(-time.Second)}, []error{s.ErrInvalidTask, s.ErrInvalidSchedule, s.ErrInvalidOption}},
 	}
@@ -1307,7 +1309,7 @@ func TestRegisterTaskValidRegistrationsAreAccepted(t *testing.T) {
 		"valid range":    {s.WithNotBefore(now), s.WithNotAfter(now.Add(time.Hour))},
 		"backfill":       {s.WithNotBefore(now.Add(-time.Hour)), s.WithBackfill()},
 		"only not after": {s.WithNotAfter(now)},
-		"all callbacks":  {s.WithSuccessCallback(func(context.Context) {}), s.WithErrorCallback(func(context.Context, error) {}), s.WithCancelCallback(func(context.Context) {})},
+		"all callbacks":  {s.WithSuccessCallback(func(context.Context) {}), s.WithErrorCallback(func(context.Context, error) {}), s.WithSkipCallback(func(context.Context, s.TriggerMetadata) {}), s.WithRemovedCallback(func(context.Context) {})},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scheduler := s.New()
@@ -1328,7 +1330,7 @@ func TestRejectedRegistrationLeavesExistingTaskIntact(t *testing.T) {
 			func(ctx context.Context, meta s.TriggerMetadata) error { runs.Add(1); return nil },
 			s.WithIntervalSchedule(time.Second),
 			s.WithID("a"),
-			s.WithCancelCallback(func(ctx context.Context) { cancels.Add(1) }),
+			s.WithRemovedCallback(func(ctx context.Context) { cancels.Add(1) }),
 		))
 
 		err := scheduler.RegisterTask(
@@ -1381,7 +1383,7 @@ func TestFirstWindowOfTaskRegisteredBeforeStartBeginsAtStart(t *testing.T) {
 		var cancels atomic.Int32
 
 		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("idle"),
-			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
 
 		time.Sleep(time.Minute)
 		start := time.Now()
@@ -1479,7 +1481,7 @@ func TestLongRunningTaskIsNotCancelled(t *testing.T) {
 		assert.NoError(t, scheduler.Start(t.Context()))
 		assert.NoError(t, scheduler.RegisterTask(rec.task(25*time.Second), s.WithIntervalSchedule(10*time.Second), s.WithID("slow"),
 			s.WithMaxDrift(time.Second),
-			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
 
 		time.Sleep(36 * time.Second)
 		synctest.Wait()
@@ -1519,7 +1521,7 @@ func TestLateRunIsCancelledAndMergedIntoNextWindow(t *testing.T) {
 		assert.NoError(t, scheduler.Start(t.Context()))
 		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("task"),
 			s.WithMaxDrift(5*time.Second),
-			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
 		// Runs at 19s; rescheduling it blocks the main loop until 27s, so the task's 20s timer is handled at 27s.
 		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil },
 			blockingOnceSchedule{first: 19 * time.Second, block: 8 * time.Second}, s.WithID("blocker"), s.WithMaxDrift(time.Hour)))
@@ -1554,7 +1556,7 @@ func TestRestartAfterLongStopMergesMissedWindows(t *testing.T) {
 		assert.NoError(t, scheduler.Start(t.Context()))
 		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("task"),
 			s.WithMaxDrift(5*time.Second),
-			s.WithCancelCallback(func(context.Context) { cancels.Add(1) })))
+			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
 
 		time.Sleep(15 * time.Second)
 		assert.NoError(t, scheduler.Stop())
@@ -1799,5 +1801,73 @@ func TestTasksWithoutIDDoNotReplaceEachOther(t *testing.T) {
 		assert.Equal(t, int32(3), a.Load())
 		assert.Equal(t, int32(3), b.Load())
 		assert.Len(t, scheduler.ScheduledTasks(), 2)
+	})
+}
+
+func TestSkipCallbackReceivesSkippedRunMetadata(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		rec := &windowRecorder{}
+		var mu sync.Mutex
+		var skipped []s.TriggerMetadata
+		var removed atomic.Int32
+		origin := time.Now()
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, scheduler.RegisterTask(rec.task(0), s.WithIntervalSchedule(10*time.Second), s.WithID("task"),
+			s.WithMaxDrift(5*time.Second),
+			s.WithSkipCallback(func(ctx context.Context, meta s.TriggerMetadata) {
+				mu.Lock()
+				defer mu.Unlock()
+				skipped = append(skipped, meta)
+			}),
+			s.WithRemovedCallback(func(context.Context) { removed.Add(1) })))
+		// Rescheduling this task blocks the main loop until 27s, so the 20s timer is handled late.
+		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil },
+			blockingOnceSchedule{first: 19 * time.Second, block: 8 * time.Second}, s.WithID("blocker"), s.WithMaxDrift(time.Hour)))
+
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		scheduler.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if assert.Len(t, skipped, 1) {
+			m := skipped[0]
+			assert.True(t, origin.Add(10*time.Second).Equal(m.TriggerWindowStart), "window start %s", m.TriggerWindowStart.Sub(origin))
+			assert.True(t, origin.Add(20*time.Second).Equal(m.TriggerWindowEnd), "window end %s", m.TriggerWindowEnd.Sub(origin))
+			assert.True(t, origin.Add(20*time.Second).Equal(m.ExpectedTriggerTime), "expected %s", m.ExpectedTriggerTime.Sub(origin))
+			assert.True(t, origin.Add(27*time.Second).Equal(m.ActualTriggerTime), "actual (skip time) %s", m.ActualTriggerTime.Sub(origin))
+		}
+		assert.Equal(t, int32(0), removed.Load(), "a drift skip must not call the removed callback")
+	})
+}
+
+func TestRemovingOrReplacingTaskDoesNotCallSkipCallback(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := s.New()
+		var skips, removed atomic.Int32
+		register := func(id string) error {
+			return scheduler.RegisterTask(
+				func(context.Context, s.TriggerMetadata) error { return nil },
+				s.WithIntervalSchedule(time.Second), s.WithID(id),
+				s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { skips.Add(1) }),
+				s.WithRemovedCallback(func(context.Context) { removed.Add(1) }))
+		}
+
+		assert.NoError(t, scheduler.Start(t.Context()))
+		assert.NoError(t, register("replaced"))
+		assert.NoError(t, register("removed"))
+		tickXSeconds(time.Second)
+
+		assert.NoError(t, register("replaced")) // replaces
+		assert.NoError(t, scheduler.RemoveTask("removed"))
+		synctest.Wait()
+		scheduler.Stop()
+
+		assert.Equal(t, int32(2), removed.Load(), "replacement and removal each call the removed callback once")
+		assert.Equal(t, int32(0), skips.Load(), "replacement and removal must not call the skip callback")
 	})
 }
