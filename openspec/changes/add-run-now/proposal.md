@@ -23,4 +23,4 @@ Operators often need to trigger a scheduled task immediately (after a fix, from 
 
 - `scheduler.go`: `Scheduler` interface, `TriggerMetadata.Manual`, a run-now request channel handled by the main loop, a per-unit "running" flag.
 - Exported error values `ErrTaskNotFound`, `ErrTaskRunning`, `ErrSchedulerNotRunning`.
-- Dependencies: depends on `fix-shared-state-races` (the "running" flag and window metadata must be owned by the main loop) and should land after `fix-mainloop-self-send-deadlock`. Interplay with `add-overlap-policy`: this change keeps today's "wait" behaviour for scheduled triggers; that change will extend its policies to cover manual runs.
+- Dependencies: depends on `fix-shared-state-races` (the "running" flag and window metadata must be owned by the main loop) and should land after `fix-mainloop-self-send-deadlock`. A scheduled trigger that falls due during a manual run behaves as during any other run: it starts afterwards if it is within MaxDrift late, otherwise it is skipped and merged into the next window.

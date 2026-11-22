@@ -10,7 +10,7 @@ Runs are triggered by a `time.AfterFunc` timer that sends the unit on `tasksIn`;
 
 **Non-Goals:**
 - Queueing multiple manual requests (a second request while running is rejected).
-- Overlap policies other than "wait" (`add-overlap-policy`).
+- Overlap policies. What a scheduled trigger does while a run is executing is governed by MaxDrift (generous: runs back to back; small: skipped and merged).
 - Run-now for tasks registered while the scheduler is idle (returns `ErrSchedulerNotRunning`).
 
 ## Decisions
