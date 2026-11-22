@@ -45,22 +45,26 @@ Each task SHALL have an ID that is fixed at registration and does not change for
 - **THEN** each is stored under a different generated ID and both run
 
 ### Requirement: Replacing a task
-Registering a task with an ID that is already registered SHALL replace the existing task: its pending timer is stopped, its cancel callback is invoked asynchronously, and only the new task is scheduled from then on. Replacement SHALL be atomic: when registrations with the same ID race, exactly one task ends up registered and every other task registered under that ID is displaced and has its cancel callback invoked exactly once.
+Registering a task with an ID that is already registered SHALL replace the existing task: its pending timer is stopped, its removed callback is invoked asynchronously, and only the new task is scheduled from then on. Replacement SHALL be atomic: when registrations with the same ID race, exactly one task ends up registered and every other task registered under that ID is displaced and has its removed callback invoked exactly once. Replacement and removal are the only events that invoke a task's removed callback.
 
 #### Scenario: Overwrite with same ID
 - **WHEN** a second task is registered under an existing ID
-- **THEN** the first task no longer runs, its cancel callback is called, and the second task runs on its schedule
+- **THEN** the first task no longer runs, its removed callback is called, and the second task runs on its schedule
 
 #### Scenario: Concurrent registrations with the same ID
 - **WHEN** N tasks are registered under the same ID concurrently
-- **THEN** exactly one of them remains registered and runs, and the cancel callbacks of the other N-1 are each called exactly once
+- **THEN** exactly one of them remains registered and runs, and the removed callbacks of the other N-1 are each called exactly once
+
+#### Scenario: Overwrite does not call the skip callback
+- **WHEN** a task with a skip callback is replaced
+- **THEN** its skip callback is not called
 
 ### Requirement: Removing a task
-The scheduler SHALL remove a task by ID, stop its pending timer and invoke its cancel callback asynchronously. Removal SHALL be atomic: when removals of the same ID race, exactly one succeeds.
+The scheduler SHALL remove a task by ID, stop its pending timer and invoke its removed callback asynchronously. Removal SHALL be atomic: when removals of the same ID race, exactly one succeeds.
 
 #### Scenario: Remove existing task
 - **WHEN** a registered task is removed
-- **THEN** it no longer runs and its cancel callback is called
+- **THEN** it no longer runs and its removed callback is called
 
 #### Scenario: Remove unknown task
 - **WHEN** RemoveTask is called with an ID that is not registered
@@ -68,7 +72,11 @@ The scheduler SHALL remove a task by ID, stop its pending timer and invoke its c
 
 #### Scenario: Concurrent removals of the same ID
 - **WHEN** RemoveTask is called concurrently several times for one registered ID
-- **THEN** exactly one call returns no error, the others return the not-found error, and the cancel callback is called exactly once
+- **THEN** exactly one call returns no error, the others return the not-found error, and the removed callback is called exactly once
+
+#### Scenario: Removal does not call the skip callback
+- **WHEN** a task with a skip callback is removed
+- **THEN** its skip callback is not called
 
 ### Requirement: Listing tasks
 The scheduler SHALL return the task functions of all registered tasks.
@@ -105,7 +113,7 @@ RegisterTask SHALL reject, with a non-nil error and without storing or schedulin
 - **THEN** an error matching ErrInvalidOption is returned
 
 #### Scenario: Nil callback
-- **WHEN** RegisterTask is called with a success, error or cancel callback option holding a nil function
+- **WHEN** RegisterTask is called with a success, error, skip or removed callback option holding a nil function
 - **THEN** an error matching ErrInvalidOption is returned
 
 #### Scenario: Multiple problems
@@ -113,8 +121,8 @@ RegisterTask SHALL reject, with a non-nil error and without storing or schedulin
 - **THEN** the returned error matches both ErrInvalidTask and ErrInvalidOption
 
 ### Requirement: Rejected registration leaves existing task intact
-A registration that fails validation SHALL NOT replace, cancel or reschedule a task already registered under the same ID.
+A registration that fails validation SHALL NOT replace, remove or reschedule a task already registered under the same ID.
 
 #### Scenario: Invalid overwrite
 - **WHEN** a task is registered under ID "a" and then an invalid registration is attempted under ID "a"
-- **THEN** the original task keeps running on its schedule and its cancel callback is not called
+- **THEN** the original task keeps running on its schedule and its removed callback is not called

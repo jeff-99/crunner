@@ -60,7 +60,11 @@ func WithQueueSize(n int) SchedulerOption {
 type (
 	SuccessCallback func(ctx context.Context)
 	ErrorCallback   func(ctx context.Context, err error)
-	CancelCallback  func(ctx context.Context)
+	// SkipCallback is called when a run is skipped for drift. meta describes the skipped run: its trigger
+	// window, its expected trigger time and, as ActualTriggerTime, the moment the skip was decided.
+	SkipCallback func(ctx context.Context, meta TriggerMetadata)
+	// RemovedCallback is called when a task is removed or replaced and will therefore never run again.
+	RemovedCallback func(ctx context.Context)
 )
 
 type SchedulingOptions struct {
@@ -72,7 +76,8 @@ type SchedulingOptions struct {
 	ID        string
 	OnSuccess *SuccessCallback
 	OnError   *ErrorCallback
-	OnCancel  *CancelCallback
+	OnSkip    *SkipCallback
+	OnRemoved *RemovedCallback
 
 	// Timeout overrides the scheduler's task timeout for this task; nil inherits it.
 	Timeout *time.Duration
@@ -88,10 +93,10 @@ func WithDefaultOptions() SchedulingOptions {
 }
 
 // WithMaxDrift sets how late a run may start relative to its expected trigger time (default 30s).
-// A later run is cancelled: it is not executed, the cancel callback is called once, and its window is
-// merged into the next run's window, which fires at the schedule's next point after now. For long
-// intervals (e.g. a daily cron) that means a cancelled run's work waits up to one interval, so use a
-// larger MaxDrift for such tasks.
+// A later run is skipped: it is not executed, the skip callback (WithSkipCallback) is called once, and
+// its window is merged into the next run's window, which fires at the schedule's next point after now.
+// For long intervals (e.g. a daily cron) that means a skipped run's work waits up to one interval, so
+// use a larger MaxDrift for such tasks.
 func WithMaxDrift(d time.Duration) SchedulingOption {
 	return func(o *SchedulingOptions) {
 		o.MaxDrift = d
@@ -142,9 +147,22 @@ func WithTimeout(d time.Duration) SchedulingOption {
 	}
 }
 
-func WithCancelCallback(f CancelCallback) SchedulingOption {
+// WithSkipCallback sets a callback called once when a run is skipped because it started more than
+// MaxDrift late. The task is not gone: the skipped window is merged into its next run. The callback runs
+// asynchronously, never blocks scheduling, and Stop waits for it. It is never called for backfilling
+// tasks, which are not skipped.
+func WithSkipCallback(f SkipCallback) SchedulingOption {
 	return func(o *SchedulingOptions) {
-		o.OnCancel = &f
+		o.OnSkip = &f
+	}
+}
+
+// WithRemovedCallback sets a callback called when the task is removed (RemoveTask) or replaced by a new
+// registration with the same ID, that is, when it will never run again. It is not called for drift
+// skips; see WithSkipCallback.
+func WithRemovedCallback(f RemovedCallback) SchedulingOption {
+	return func(o *SchedulingOptions) {
+		o.OnRemoved = &f
 	}
 }
 
@@ -231,7 +249,8 @@ type schedulingUnit struct {
 
 	onError   *ErrorCallback
 	onSuccess *SuccessCallback
-	onCancel  *CancelCallback
+	onSkip    *SkipCallback
+	onRemoved *RemovedCallback
 
 	// snapshot of counts at last summary report (read/written only from mainLoop goroutine)
 	lastReportedCount        int
@@ -298,7 +317,8 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 
 		onSuccess: opts.OnSuccess,
 		onError:   opts.OnError,
-		onCancel:  opts.OnCancel,
+		onSkip:    opts.OnSkip,
+		onRemoved: opts.OnRemoved,
 	}
 
 	// Swap the new unit in atomically; exactly the unit it displaced (if any) is cancelled.
@@ -307,13 +327,13 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 		s.logger.Trace().Str("task", id).Msg("Overwriting existing task registration")
 		// The main loop stops the overwritten unit's timer when it sees the new unit;
 		// a stale timer that fires first is dropped by the main loop's identity check.
-		if existingUnit, ok := previous.(*schedulingUnit); ok && existingUnit.onCancel != nil {
+		if existingUnit, ok := previous.(*schedulingUnit); ok && existingUnit.onRemoved != nil {
 			callbackCtx := context.Background()
 			if s.schedulerCtx != nil {
 				callbackCtx = s.schedulerCtx
 			}
-			s.logger.Trace().Str("task", id).Msg("Calling cancel callback for overwritten task")
-			f := *existingUnit.onCancel
+			s.logger.Trace().Str("task", id).Msg("Calling removed callback for overwritten task")
+			f := *existingUnit.onRemoved
 			go f(callbackCtx) // Run in a goroutine to avoid blocking registration
 		}
 	}
@@ -340,9 +360,9 @@ func (s *internalScheduler) scheduleTask(su *schedulingUnit) {
 
 // scheduleWindow computes the task's next window and sets its timer. Every window starts at
 // coveredUntil. Normally the window ends at the schedule's next point after that start. When
-// cancelledEnd is set, the previous window was cancelled for drift: the new window then also covers
+// skippedEnd is set, the previous run was skipped for drift: the new window then also covers
 // it and ends at the first point of the schedule after now.
-func (s *internalScheduler) scheduleWindow(su *schedulingUnit, cancelledEnd *time.Time) {
+func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.Time) {
 	if s.state.Load() != stateRunning {
 		s.logger.Trace().Str("task", su.ID()).Msg("Scheduler not running, skipping task scheduling")
 		return
@@ -367,14 +387,14 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, cancelledEnd *tim
 
 	var triggerWindowEnd time.Time
 	var err error
-	if cancelledEnd == nil {
+	if skippedEnd == nil {
 		var ref *time.Time
 		if su.hasRun {
 			ref = &triggerWindowStart
 		}
 		triggerWindowEnd, err = su.schedule.Next(ctx, triggerWindowStart, ref)
 	} else {
-		triggerWindowEnd = *cancelledEnd
+		triggerWindowEnd = *skippedEnd
 		for err == nil && !triggerWindowEnd.After(now) {
 			var next time.Time
 			next, err = su.schedule.Next(ctx, triggerWindowStart, &triggerWindowEnd)
@@ -455,21 +475,24 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 	mayExecute := drift <= su.options.MaxDrift
 
 	if !mayExecute {
-		s.logger.Warn().Str("task", su.ID()).Time("expectedTriggerTime", su.meta.ExpectedTriggerTime).Time("actualTime", now).Dur("drift", drift).Dur("maxDrift", su.options.MaxDrift).Time("windowStart", su.meta.TriggerWindowStart).Time("windowEnd", su.meta.TriggerWindowEnd).Msg("Task run cancelled due to excessive drift; its window is merged into the next run")
+		s.logger.Warn().Str("task", su.ID()).Time("expectedTriggerTime", su.meta.ExpectedTriggerTime).Time("actualTime", now).Dur("drift", drift).Dur("maxDrift", su.options.MaxDrift).Time("windowStart", su.meta.TriggerWindowStart).Time("windowEnd", su.meta.TriggerWindowEnd).Msg("Task run skipped due to excessive drift; its window is merged into the next run")
 
-		if su.onCancel != nil {
-			f := *su.onCancel
+		// Copy the skipped run's metadata before scheduleWindow overwrites it with the merged window.
+		skippedMeta := *su.meta
+		skippedMeta.ActualTriggerTime = now
+		if su.onSkip != nil {
+			f := *su.onSkip
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
 				defer cancel()
-				f(ctx)
+				f(ctx, skippedMeta)
 			}()
 		} else {
 			cancel()
 		}
-		cancelledEnd := su.meta.TriggerWindowEnd
-		s.scheduleWindow(su, &cancelledEnd)
+		skippedEnd := su.meta.TriggerWindowEnd
+		s.scheduleWindow(su, &skippedEnd)
 		return
 	}
 
@@ -778,9 +801,9 @@ func (s *internalScheduler) RemoveTask(id string) error {
 	if s.schedulerCtx != nil {
 		callbackCtx = s.schedulerCtx
 	}
-	if su.onCancel != nil {
-		s.logger.Trace().Str("task", id).Msg("Calling cancel callback for removed task")
-		f := *su.onCancel
+	if su.onRemoved != nil {
+		s.logger.Trace().Str("task", id).Msg("Calling removed callback for removed task")
+		f := *su.onRemoved
 		go f(callbackCtx)
 	}
 

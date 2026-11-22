@@ -63,8 +63,11 @@ func validateRegistration(task Task, schedule Schedule, opts SchedulingOptions) 
 	if opts.OnError != nil && *opts.OnError == nil {
 		errs = append(errs, fmt.Errorf("%w: error callback must not be nil", ErrInvalidOption))
 	}
-	if opts.OnCancel != nil && *opts.OnCancel == nil {
-		errs = append(errs, fmt.Errorf("%w: cancel callback must not be nil", ErrInvalidOption))
+	if opts.OnSkip != nil && *opts.OnSkip == nil {
+		errs = append(errs, fmt.Errorf("%w: skip callback must not be nil", ErrInvalidOption))
+	}
+	if opts.OnRemoved != nil && *opts.OnRemoved == nil {
+		errs = append(errs, fmt.Errorf("%w: removed callback must not be nil", ErrInvalidOption))
 	}
 
 	return errors.Join(errs...)
