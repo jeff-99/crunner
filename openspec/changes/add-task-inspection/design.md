@@ -1,29 +1,31 @@
 ## Context
 
-Task state lives in `schedulingUnit.meta` (`scheduler.go:155-175`) plus the pending `timer`. Today the task goroutine writes `meta` (`scheduler.go:440-456`) while the main loop reads it; `fix-shared-state-races` makes the main loop the sole owner of this state. Inspection must read the same state from caller goroutines without reintroducing races.
+Task state lives in `schedulingUnit.meta` plus the pending `timer`, and is owned by the main loop: it is mutated in `scheduleWindow`, `processTask` and `handleRunResult`, all on the main loop. Before `Start` (and for a task being registered) the caller goroutine is the only one touching a unit. Inspection must read this state from arbitrary caller goroutines without reintroducing races, including during the `Start` and `Stop` transitions.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Race-free, copy-based snapshots of every task.
-- Expose what the scheduler already tracks; no new bookkeeping beyond "next run time" and "running".
+- Race-free, copy-based snapshots of every task at any time (idle, starting, running, stopping, stopped).
+- Expose what the scheduler already tracks; new bookkeeping only for "next run time" and "running".
 
 **Non-Goals:**
-- Tags (added by `add-task-tags`), metrics/event hooks (`replace-summary-logging-with-hooks`), history of past runs.
+- Tags (`add-task-tags`), metrics/event hooks (`replace-summary-logging-with-hooks`), history of past runs, counters for skipped runs.
 
 ## Decisions
 
-- **`TaskInfo` is a plain struct of values** (times as `time.Time`, zero meaning "never"; `LastError error`). Avoids `*time.Time` aliasing seen in `TriggerMetadata`. Alternative: return `TriggerMetadata` — rejected, it lacks next run / running and contains pointers.
-- **Snapshots via the main loop while running**: `Task`/`ScheduledTasks` send a request on an inspection channel and the main loop replies with copies built from state it owns. When the scheduler is idle no goroutine mutates task state, so snapshots are built directly from the registry under its lock. Alternative: a per-unit `sync.RWMutex` — rejected as it contradicts the single-owner model from `fix-shared-state-races`.
-- **Next run time** is recorded by the main loop when it arms a timer (the computed fire time); cleared when no run is pending (idle scheduler, schedule error).
-- **Running flag** set by the main loop when it launches a run and cleared when it receives the completion message.
-- **Ordering**: sort by ID for deterministic output (the `sync.Map` range order is random).
+- **Publish immutable snapshots instead of asking the main loop.** Each `schedulingUnit` holds an `atomic.Pointer[TaskInfo]`. The writer builds a fresh `TaskInfo` after every state change and stores it; `Task`/`ScheduledTasks` only load. The writer is always a single goroutine: `RegisterTask` before the unit is stored in the registry, then the main loop. Alternatives rejected: a request/reply channel to the main loop with a direct read when idle (racy around `Start`, blocks while the loop is busy or gone); a per-unit mutex (contradicts the single-owner model).
+- **`TaskInfo` is a plain struct of values** (times as `time.Time`, zero meaning "never"; `LastError error`) named like `TriggerMetadata`, avoiding the `*time.Time` aliasing there. Alternative: return `TriggerMetadata` — rejected, it lacks next run / running and contains pointers.
+- **Publish points** (all on the main loop except the first): `RegisterTask` (initial zero-count snapshot), `scheduleWindow` when a timer is armed (sets `NextRunTime` to the moment it fires and the upcoming window) or when scheduling fails (clears `NextRunTime`), `processTask` when a run is launched (`Running = true`, `NextRunTime` cleared), `handleRunResult` (counts, times, last error, `Running = false`), and main loop exit (clears `NextRunTime` and `Running`, since timers are stopped).
+- **Next run time** is when the armed timer fires: the expected trigger time, or now when that is in the past or for backfill.
+- **Ordering**: `ScheduledTasks` sorts by ID for deterministic output (the registry range order is random). A listing is a set of per-task snapshots, not one atomic view of all tasks.
+- **Generated IDs become discoverable** through `ScheduledTasks`, closing the gap left by `require-stable-task-ids`.
 
 ## Risks / Trade-offs
 
-- [Inspection blocks while the main loop is busy] → requests are cheap and the main loop never blocks on user code after `fix-mainloop-self-send-deadlock`; requests also select on the scheduler context to avoid hanging during Stop.
-- [Breaking return type] → stated in proposal; pre-v1.
+- [A snapshot can lag the true state by one state change] → Each snapshot is internally consistent and replaced atomically; the lag is bounded by the main loop's processing of a single message.
+- [Allocation of one `TaskInfo` per state change] → A handful per run; negligible next to a run.
+- [Breaking return type and interface method] → Stated in the proposal; pre-v1.
 
 ## Migration Plan
 
-Callers that used `len(ScheduledTasks())` keep working; callers needing the funcs must keep their own references.
+Callers that used `len(ScheduledTasks())` keep working; callers needing the funcs must keep their own references. Callers that need generated IDs read them from `ScheduledTasks`.
