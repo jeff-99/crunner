@@ -2,32 +2,37 @@
 
 ## Context
 
-In `processTask` (scheduler.go:391-424), the drift-skip path does the following:
-1. sets `LastRunTime = now`;
-2. calls `*su.onCancel` synchronously on the main loop, with a context derived from the scheduler;
-3. sends to `newTaskCh`.
+In `processTask`, the drift path (a run that would start more than MaxDrift after its expected trigger time) already does the following on the main loop:
+1. logs the skip;
+2. starts `*su.onCancel` in a goroutine tracked by `s.wg`, with a context derived from the scheduler context that is cancelled when the callback returns;
+3. computes the next, merged window with `scheduleWindow(su, &cancelledEnd)`. That call overwrites `su.meta` (window start/end, expected trigger time).
 
-The overwrite path (scheduler.go:245-255) and `RemoveTask` (scheduler.go:667-671) also call `onCancel`, but in a goroutine. Before the skip path runs, `ActualTriggerTime` has not been set yet for this run.
+`RegisterTask` (replacement) and `RemoveTask` also call `onCancel`, in a goroutine, with the scheduler context (or `context.Background()` when the scheduler never started). `validate.go` rejects a nil func inside an `OnSuccess`/`OnError`/`OnCancel` option.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Give drift skips a dedicated callback with the metadata of the missed window.
-- Stop running user code synchronously on the main loop for skips.
+- Give drift skips a dedicated callback with the metadata of the skipped run.
+- Reserve the other callback for removal and replacement, and name it accordingly.
+- Keep user code off the main loop and keep `Stop` waiting for it.
 
 **Non-Goals:**
-- Changing when a skip happens. That is covered by `make-trigger-windows-contiguous` and `add-overlap-policy`.
-- Scheduler-wide hooks. That is `replace-summary-logging-with-hooks`.
-- Telling "removed" and "replaced" apart in the cancel callback.
+- Changing when a skip happens or how the next window is computed (`make-trigger-windows-contiguous`).
+- Scheduler-wide hooks (`replace-summary-logging-with-hooks`).
+- Telling removal and replacement apart, or passing a reason (can be added later).
+- Scheduler-level start/stop callbacks. A scheduler's `Start` and `Stop` are synchronous calls whose caller already knows when they return; lifecycle hooks can be added to the hooks change later if needed.
+- Passing the merged window to the skip callback.
 
 ## Decisions
 
-- **Signature: `func(ctx context.Context, meta TriggerMetadata)`.** It reuses the type that tasks already receive, so no new types are needed. Before the copy is taken, `ActualTriggerTime` is set to the skip time so that callers can compute the drift. Considered: a dedicated `SkipInfo{Drift, MaxDrift, ...}`. That can be added later through the hooks change.
-- **Asynchronous call.** Take a copy of the metadata on the main loop, then call `go f(ctx, metaCopy)`. Copying on the main loop avoids racing on `su.meta`. The context is the scheduler context, the same as the cancel callback uses.
-- **Storage follows the existing callback style.** Use `OnSkip *SkipCallback` in `SchedulingOptions` and `onSkip` in `schedulingUnit`, consistent with the other callbacks on main. `tidy-public-api` converts all of them together.
-- **No fallback to `OnCancel`.** A clean split is the whole point. The break is documented in the proposal.
+- **Two names, no fallback.** `WithSkipCallback` for drift; `WithRemovedCallback` (renamed from `WithCancelCallback`) for removal and replacement. The rename turns a silent behaviour change into a compile error. No deprecated alias, since the project is pre-1.0. "Removed" covers both `RemoveTask` and replacement by a new registration: in both cases the task will never run again.
+- **Signature: `SkipCallback func(ctx context.Context, meta TriggerMetadata)`.** It reuses the metadata type tasks already receive. The copy is taken on the main loop **before** `scheduleWindow` rewrites `su.meta`, with `ActualTriggerTime` set to the moment the skip was decided so callers can compute the drift. Only the skipped run's own window is reported; the merged window that covers it is not part of the callback. `RemovedCallback` stays `func(ctx context.Context)`.
+- **Asynchronous, tracked, same context as today.** The skip callback runs in a goroutine counted in `s.wg`, with the scheduler-derived context cancelled when it returns, so `Stop` waits for it and a blocking callback never delays other tasks. The removed callback keeps its current behaviour (a goroutine with the scheduler context).
+- **Backfilling tasks never skip,** so their skip callback is never called; documented on the option.
+- **Storage follows the existing callback style.** `OnSkip` and `OnRemoved` fields in `SchedulingOptions`, `onSkip` and `onRemoved` in `schedulingUnit`, pointer-to-func like the other callbacks on main; `tidy-public-api` converts all of them together. Validation treats the new callbacks exactly like the existing ones.
 
 ## Risks / Trade-offs
 
-- [Silent behaviour change for existing `OnCancel` users who expected skip notifications] → Marked BREAKING. The changelog and doc comments on both options point to the other one.
+- [Existing `WithCancelCallback` users must update] → The rename makes every affected call site fail to compile; the PR lists the mapping.
 - [Many skip callbacks can pile up as goroutines if a task keeps getting skipped] → At most one skip per scheduled run, so the rate is bounded by the schedule.
+- [Skip callback runs concurrently with the task's next run] → Documented; it already behaves like this for the cancel callback today.

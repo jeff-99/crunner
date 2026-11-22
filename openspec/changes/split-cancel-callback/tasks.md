@@ -2,11 +2,16 @@
 
 ## 1. Skip callback
 
-- [ ] 1.1 Add the `SkipCallback` type, the `SchedulingOptions.OnSkip` field, the `schedulingUnit.onSkip` field and the `WithSkipCallback` option with a doc comment; verify `go vet ./...` passes
-- [ ] 1.2 On the drift-skip path in `processTask`, set `ActualTriggerTime`, copy the metadata and call `onSkip` in a goroutine; remove the `onCancel` call there; verify with a `testing/synctest` test that forces drift: the skip callback receives the expected window/trigger times and the cancel callback is not called
-- [ ] 1.3 Add a `testing/synctest` test where the skip callback blocks; verify that a second task still runs on schedule
+- [ ] 1.1 Add `SkipCallback`, `SchedulingOptions.OnSkip`, `schedulingUnit.onSkip` and `WithSkipCallback` with a doc comment (called once per drift skip, async, never for backfilling tasks); add the nil check for it in `validate.go`; verify `go vet ./...` passes
+- [ ] 1.2 On the drift path in `processTask`, copy the metadata before `scheduleWindow` overwrites it, set `ActualTriggerTime` to the skip time, and start `onSkip` in a goroutine tracked by `s.wg` with the derived context; stop calling the removal callback there; verify with a `testing/synctest` test that forces drift: the skip callback receives the skipped window, expected trigger time and skip time, and the removed callback is not called
+- [ ] 1.3 Test: a blocking skip callback does not delay another task, and `Stop` waits for it
 
-## 2. Cancel semantics and docs
+## 2. Removed callback rename and semantics
 
-- [ ] 2.1 Update the `WithCancelCallback` doc comment to say "removed or replaced only"; verify that the existing `TestRemoveTaskCancelCallback` and `TestOverwriteTaskCancelCallback` still pass
-- [ ] 2.2 Add a test where replacing a task that has a skip callback does not call that skip callback; verify `go test -race ./...` passes
+- [ ] 2.1 Rename `WithCancelCallback`, `CancelCallback`, `SchedulingOptions.OnCancel` and `schedulingUnit.onCancel` to `WithRemovedCallback`, `RemovedCallback`, `OnRemoved` and `onRemoved`; update `validate.go`, doc comments ("called only when the task is removed or replaced") and all tests; verify `TestRemoveTaskCancelCallback`, `TestOverwriteTaskCancelCallback` and the atomic-registration tests pass under the new names
+- [ ] 2.2 Test: replacing or removing a task that has a skip callback does not call it; skipping a run for a task that has a removed callback does not call that
+- [ ] 2.3 Update the tests that used the cancel callback as the drift signal (late-run, restart, long-running, mass and blocking drift tests) to use `WithSkipCallback`, keeping their assertions that the removed callback is not called; add `WithSkipCallback(nil)` and `WithRemovedCallback(nil)` cases to `TestRegisterTaskValidation`
+
+## 3. Verification
+
+- [ ] 3.1 Run `go test -race ./...` (high counts with `-skip /5_days`) and confirm all tests pass; the PR description lists the rename mapping and the behaviour change
