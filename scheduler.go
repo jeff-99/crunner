@@ -92,11 +92,13 @@ func WithDefaultOptions() SchedulingOptions {
 	}
 }
 
-// WithMaxDrift sets how late a run may start relative to its expected trigger time (default 30s).
-// A later run is skipped: it is not executed, the skip callback (WithSkipCallback) is called once, and
-// its window is merged into the next run's window, which fires at the schedule's next point after now.
-// For long intervals (e.g. a daily cron) that means a skipped run's work waits up to one interval, so
-// use a larger MaxDrift for such tasks.
+// WithMaxDrift sets how late a run may start relative to its expected trigger time, the end of its
+// window (default 30s). A later run is skipped: it is not executed, the skip callback
+// (WithSkipCallback) is called once, and its window is merged into the next run's window, which fires at
+// the schedule's next point after now. Drift includes time spent waiting for the task's own previous
+// run, so a task whose runs overrun its interval by more than MaxDrift is skipped now and then; raise
+// MaxDrift for tasks that may overrun. For long intervals (e.g. a daily cron) a skipped run's work waits
+// up to one interval.
 func WithMaxDrift(d time.Duration) SchedulingOption {
 	return func(o *SchedulingOptions) {
 		o.MaxDrift = d
@@ -222,10 +224,9 @@ type internalScheduler struct {
 // runResult is sent by a task goroutine to the main loop, the sole owner of
 // per-task mutable state, when a run has finished.
 type runResult struct {
-	unit   *schedulingUnit
-	start  time.Time
-	finish time.Time
-	err    error
+	unit  *schedulingUnit
+	start time.Time
+	err   error
 }
 
 type schedulingUnit struct {
@@ -240,8 +241,6 @@ type schedulingUnit struct {
 	coveredUntil time.Time
 	// hasRun reports whether any window has been executed, i.e. whether coveredUntil is a previous window end.
 	hasRun bool
-	// previousFinish is when the previous run finished; a run is never expected before it.
-	previousFinish time.Time
 
 	timer *time.Timer
 
@@ -415,11 +414,8 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.
 		su.backfilling = true
 		s.logger.Trace().Str("task", su.ID()).Time("windowStart", triggerWindowStart).Time("windowEnd", triggerWindowEnd).Msg("Task is backfilling")
 	} else {
-		// A run is never expected before the previous run finished, so a long run cannot make its successor late.
+		// Drift is measured from the window end, so a run delayed by its own previous run counts as late.
 		expectedTriggerTime = triggerWindowEnd
-		if su.previousFinish.After(expectedTriggerTime) {
-			expectedTriggerTime = su.previousFinish
-		}
 		su.backfilling = false
 	}
 
@@ -547,7 +543,7 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		select {
 		case <-s.schedulerCtx.Done():
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Scheduler context done, not reporting run result.")
-		case s.doneCh <- runResult{unit: taskUnit, start: now, finish: finished, err: err}:
+		case s.doneCh <- runResult{unit: taskUnit, start: now, err: err}:
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Run result sent to main loop.")
 		}
 	}(su)
@@ -562,7 +558,6 @@ func (s *internalScheduler) handleRunResult(r runResult) {
 	su.meta.Count++
 	su.coveredUntil = su.meta.TriggerWindowEnd
 	su.hasRun = true
-	su.previousFinish = r.finish
 	if r.err != nil {
 		su.meta.LastErroredRunTime = &now
 		su.meta.ErrorCount++

@@ -40,7 +40,7 @@ When backfill is enabled and NotBefore is set, the scheduler SHALL run the task 
 - **THEN** it runs back-to-back for each past window and then continues on schedule
 
 ### Requirement: Drift skipping
-The expected trigger time of a run SHALL be the later of its window end and the time the task's previous run finished. When a task that is not backfilling would start more than its maximum drift (default 30 seconds) after its expected trigger time, the run SHALL be skipped: it SHALL NOT be executed and the task's skip callback SHALL be invoked once. The next run's window SHALL start at the skipped window's start and end at the first point of the schedule's sequence after the current time, and that run SHALL be triggered at that end as normal. No part of the timeline SHALL be left uncovered. The skip callback SHALL be invoked asynchronously so that it never blocks scheduling, and any number of simultaneous skips SHALL NOT stall the scheduler. The removed callback SHALL NOT be invoked for a skipped run.
+The expected trigger time of a run SHALL be the end of its trigger window. When a task that is not backfilling would start more than its maximum drift (default 30 seconds) after its expected trigger time, for whatever reason including the time taken by its own previous run, the run SHALL be skipped: it SHALL NOT be executed and the task's skip callback SHALL be invoked once. The next run's window SHALL start at the skipped window's start and end at the first point of the schedule's sequence after the current time, and that run SHALL be triggered at that end as normal. No part of the timeline SHALL be left uncovered. A run that would start late by at most the maximum drift SHALL start immediately. The skip callback SHALL be invoked asynchronously so that it never blocks scheduling, and any number of simultaneous skips SHALL NOT stall the scheduler. The removed callback SHALL NOT be invoked for a skipped run.
 
 #### Scenario: Excessive drift
 - **WHEN** an interval task of 10 seconds with MaxDrift 5 seconds has window [10s, 20s) and its timer fires at 27s
@@ -55,8 +55,12 @@ The expected trigger time of a run SHALL be the later of its window end and the 
 - **THEN** the skip callback is called once, and the next run has window [10s, 90s) and is triggered at 90s
 
 #### Scenario: Long-running task is not skipped
-- **WHEN** an interval task of 10 seconds with MaxDrift 1 second runs for 25 seconds
-- **THEN** its next window starts at the previous window's end and spans one interval, the next run starts immediately after the long run finishes, and the skip callback is not called
+- **WHEN** an interval task of 10 seconds with MaxDrift 5 seconds has window [10s, 20s), its run starts at 20s and takes 12.5 seconds, and the next window is [20s, 30s)
+- **THEN** the next run starts immediately at 32.5s with window [20s, 30s), because it is late by 2.5 seconds, which is within MaxDrift, and the skip callback is not called
+
+#### Scenario: Overrun beyond MaxDrift
+- **WHEN** the same task has window [40s, 50s) and the previous run, started at 40s, takes 19 seconds
+- **THEN** at 59s the run for window [40s, 50s) is skipped because it would be 9 seconds late, the skip callback is called once, and the next run has window [40s, 60s) and is triggered at 60s
 
 #### Scenario: Blocking skip callback
 - **WHEN** a run is skipped for drift and its skip callback blocks indefinitely
