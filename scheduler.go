@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -178,7 +179,10 @@ func WithRemovedCallback(f RemovedCallback) SchedulingOption {
 type Scheduler interface {
 	RegisterTask(task Task, schedule Schedule, options ...SchedulingOption) error
 	RemoveTask(string) error
-	ScheduledTasks() []Task
+	// ScheduledTasks returns a snapshot of every registered task, ordered by ID.
+	ScheduledTasks() []TaskInfo
+	// Task returns a snapshot of the task with the given ID, and false when it is not registered.
+	Task(id string) (TaskInfo, bool)
 	Start(ctx context.Context) error
 	Stop() error
 }
@@ -205,11 +209,28 @@ type TriggerMetadata struct {
 	LastError error
 }
 
+// runState is the context created by one Start call and the function that cancels it.
+type runState struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// currentCtx returns the scheduler context of the current or last Start, or nil if the scheduler never started.
+func (s *internalScheduler) currentCtx() context.Context {
+	if r := s.run.Load(); r != nil {
+		return r.ctx
+	}
+	return nil
+}
+
 type internalScheduler struct {
-	wg           *sync.WaitGroup
-	cancelCtx    context.CancelFunc
-	schedulerCtx context.Context
-	logger       zerolog.Logger
+	wg     *sync.WaitGroup
+	logger zerolog.Logger
+
+	// run holds the context of the current (or last) Start; it is replaced by Start and read from any goroutine.
+	run atomic.Pointer[runState]
+	// lifecycleMu serialises Start and Stop so that they never interleave.
+	lifecycleMu sync.Mutex
 
 	tasks sync.Map
 
@@ -226,6 +247,60 @@ type internalScheduler struct {
 	queueSize       int
 
 	state atomic.Int32
+}
+
+// TaskInfo is a read-only snapshot of a registered task. Zero times mean "never" or "not applicable".
+// Snapshots are copies: they never change after being returned and are safe to use from any goroutine.
+type TaskInfo struct {
+	ID string
+
+	// NextRunTime is when the next run is due to start (the expected trigger time, or now when that has
+	// passed). It is zero while the scheduler is not running, while a run executes and when the task's
+	// schedule failed.
+	NextRunTime time.Time
+	// WindowStart and WindowEnd are the trigger window of the upcoming run while the task is waiting,
+	// and of the executing run while Running is true.
+	WindowStart time.Time
+	WindowEnd   time.Time
+
+	LastRunTime           time.Time
+	LastSuccessfulRunTime time.Time
+	LastErroredRunTime    time.Time
+
+	Count           int
+	SuccessfulCount int
+	ErrorCount      int
+	LastError       error
+
+	// Running reports whether a run is currently executing.
+	Running bool
+}
+
+// publish builds an immutable snapshot of the unit's state and makes it visible to inspectors.
+// It must only be called by the goroutine that currently owns the unit (RegisterTask, then the main loop).
+func (su *schedulingUnit) publish() {
+	m := su.meta
+	info := TaskInfo{
+		ID:              su.ID(),
+		NextRunTime:     su.nextRun,
+		WindowStart:     m.TriggerWindowStart,
+		WindowEnd:       m.TriggerWindowEnd,
+		Count:           m.Count,
+		SuccessfulCount: m.SuccessfulCount,
+		ErrorCount:      m.ErrorCount,
+		LastError:       m.LastError,
+		Running:         su.running,
+	}
+	if m.LastRunTime != nil {
+		info.LastRunTime = *m.LastRunTime
+	}
+	if m.LastSuccessfulRunTime != nil {
+		info.LastSuccessfulRunTime = *m.LastSuccessfulRunTime
+	}
+	if m.LastErroredRunTime != nil {
+		info.LastErroredRunTime = *m.LastErroredRunTime
+	}
+	su.info.Store(&info)
 }
 
 // runResult is sent by a task goroutine to the main loop, the sole owner of
@@ -248,6 +323,14 @@ type schedulingUnit struct {
 	coveredUntil time.Time
 	// hasRun reports whether any window has been executed, i.e. whether coveredUntil is a previous window end.
 	hasRun bool
+
+	// nextRun is when the armed timer fires; zero when nothing is pending. running is true while a run executes.
+	// Both are owned by the main loop and published to inspectors through info.
+	nextRun time.Time
+	running bool
+	// info is the latest published snapshot. Its only writers are RegisterTask (before the unit is stored)
+	// and the main loop, so readers can load it at any time.
+	info atomic.Pointer[TaskInfo]
 
 	timer *time.Timer
 
@@ -327,6 +410,8 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 		onRemoved: opts.OnRemoved,
 	}
 
+	newSchedulingUnit.publish()
+
 	// Swap the new unit in atomically; exactly the unit it displaced (if any) is cancelled.
 	id := newSchedulingUnit.ID()
 	if previous, loaded := s.tasks.Swap(id, newSchedulingUnit); loaded {
@@ -335,8 +420,8 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 		// a stale timer that fires first is dropped by the main loop's identity check.
 		if existingUnit, ok := previous.(*schedulingUnit); ok && existingUnit.onRemoved != nil {
 			callbackCtx := context.Background()
-			if s.schedulerCtx != nil {
-				callbackCtx = s.schedulerCtx
+			if c := s.currentCtx(); c != nil {
+				callbackCtx = c
 			}
 			s.logger.Trace().Str("task", id).Msg("Calling removed callback for overwritten task")
 			f := *existingUnit.onRemoved
@@ -348,7 +433,7 @@ func (s *internalScheduler) RegisterTask(task Task, schedule Schedule, options .
 	// Only send if the scheduler is actually running.
 	if s.state.Load() == stateRunning {
 		select {
-		case <-s.schedulerCtx.Done():
+		case <-s.currentCtx().Done():
 			s.logger.Warn().Str("task", id).Msg("Scheduler context done, cannot schedule newly registered task")
 		case s.newTaskCh <- newSchedulingUnit:
 			s.logger.Trace().Str("task", id).Msg("New/overwritten task sent for scheduling")
@@ -375,7 +460,9 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.
 	}
 
 	s.logger.Trace().Str("task", su.ID()).Msg("Scheduling task")
-	ctx, cancel := withOptionalTimeout(s.schedulerCtx, s.scheduleTimeout)
+	// Captured here, on the main loop, so that a timer left over from a previous Start cannot read the context of a later one.
+	schedCtx := s.currentCtx()
+	ctx, cancel := withOptionalTimeout(schedCtx, s.scheduleTimeout)
 	defer cancel()
 
 	isBackfill := su.options.Backfill && su.options.NotBefore != nil
@@ -412,6 +499,8 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.
 	}
 	if err != nil {
 		s.logger.Error().Err(err).Str("task", su.ID()).Time("windowStart", triggerWindowStart).Msg("Failed to get next run time from schedule")
+		su.nextRun = time.Time{}
+		su.publish()
 		return
 	}
 
@@ -456,7 +545,7 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.
 		s.logger.Trace().Str("task", su.ID()).Time("fireTime", fireTime).Time("expectedTriggerTime", expectedTriggerTime).Msg("Task timer fired")
 
 		select {
-		case <-s.schedulerCtx.Done():
+		case <-schedCtx.Done():
 			s.logger.Trace().Str("task", su.ID()).Msg("Scheduler context done, not queueing task")
 			return
 		case s.tasksIn <- su:
@@ -465,10 +554,13 @@ func (s *internalScheduler) scheduleWindow(su *schedulingUnit, skippedEnd *time.
 	})
 
 	su.timer = taskTimer
+	su.nextRun = now.Add(fireAfter)
+	su.publish()
 }
 
 func (s *internalScheduler) processTask(su *schedulingUnit) {
-	ctx, cancel := context.WithCancel(s.schedulerCtx)
+	schedCtx := s.currentCtx()
+	ctx, cancel := context.WithCancel(schedCtx)
 	// defer cancel() // this cancels to early as the task has a derived context in a goroutine
 
 	s.logger.Trace().Str("task", su.ID()).Time("windowStart", su.meta.TriggerWindowStart).Time("windowEnd", su.meta.TriggerWindowEnd).Msg("Processing task")
@@ -501,6 +593,9 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 
 	su.meta.ActualTriggerTime = now
 	metaCopy := *su.meta
+	su.running = true
+	su.nextRun = time.Time{}
+	su.publish()
 
 	s.logger.Trace().Str("task", su.ID()).Msg("Task running")
 
@@ -548,7 +643,7 @@ func (s *internalScheduler) processTask(su *schedulingUnit) {
 		}
 
 		select {
-		case <-s.schedulerCtx.Done():
+		case <-schedCtx.Done():
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Scheduler context done, not reporting run result.")
 		case s.doneCh <- runResult{unit: taskUnit, start: now, err: err}:
 			s.logger.Trace().Str("task", taskUnit.ID()).Msg("Run result sent to main loop.")
@@ -574,6 +669,9 @@ func (s *internalScheduler) handleRunResult(r runResult) {
 		su.meta.SuccessfulCount++
 		su.meta.LastError = nil
 	}
+	su.running = false
+	su.nextRun = time.Time{}
+	su.publish()
 
 	if !s.isRegistered(su) {
 		s.logger.Trace().Str("task", su.ID()).Msg("Mainloop: Run result for overwritten or removed task, not rescheduling")
@@ -630,6 +728,8 @@ func (s *internalScheduler) mainLoop() {
 	s.logger.Trace().Msg("Scheduler main loop started")
 	defer s.logger.Trace().Msg("Scheduler main loop stopped") // Log when loop exits
 
+	loopCtx := s.currentCtx()
+
 	summaryTicker := time.NewTicker(s.summaryInterval)
 	defer summaryTicker.Stop()
 
@@ -641,6 +741,10 @@ func (s *internalScheduler) mainLoop() {
 			if u.timer != nil {
 				u.timer.Stop()
 			}
+			// Timers are stopped and results of runs still in flight are no longer processed.
+			u.nextRun = time.Time{}
+			u.running = false
+			u.publish()
 		}
 		close(s.loopDone)
 	}()
@@ -656,7 +760,7 @@ func (s *internalScheduler) mainLoop() {
 	for {
 		select {
 		// Case 1: Context canceled (Stop() was called)
-		case <-s.schedulerCtx.Done():
+		case <-loopCtx.Done():
 			s.logger.Trace().Msg("Mainloop: Context canceled, shutting down")
 			return // Exit loop
 
@@ -715,8 +819,10 @@ func (s *internalScheduler) mainLoop() {
 }
 
 func (s *internalScheduler) Start(ctx context.Context) error {
-	if !s.state.CompareAndSwap(stateIdle, stateRunning) {
-		currentState := s.state.Load()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if currentState := s.state.Load(); currentState != stateIdle {
 		if currentState == stateRunning {
 			s.logger.Trace().Msg("Scheduler already running")
 			return fmt.Errorf("scheduler already running")
@@ -727,11 +833,11 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 
 	s.logger.Trace().Msg("Starting scheduler")
 
-	context, cancel := context.WithCancel(ctx)
-	s.cancelCtx = cancel
-	s.schedulerCtx = context
-
+	runCtx, cancel := context.WithCancel(ctx)
+	s.run.Store(&runState{ctx: runCtx, cancel: cancel})
 	s.loopDone = make(chan struct{})
+	// Published last: anyone who sees the running state also sees the context.
+	s.state.Store(stateRunning)
 
 	//nolint:contextcheck
 	go s.mainLoop()
@@ -739,7 +845,7 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 	s.tasks.Range(func(key, value interface{}) bool {
 		schedulingUnit := value.(*schedulingUnit)
 		select {
-		case <-s.schedulerCtx.Done():
+		case <-runCtx.Done():
 			s.logger.Trace().Msg("Scheduler context done during initial task registration")
 			return false
 		case s.newTaskCh <- schedulingUnit:
@@ -752,6 +858,9 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 }
 
 func (s *internalScheduler) Stop() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	if !s.state.CompareAndSwap(stateRunning, stateStopping) {
 		currentState := s.state.Load()
 		if currentState == stateIdle || currentState == stateStopping {
@@ -764,8 +873,8 @@ func (s *internalScheduler) Stop() error {
 
 	s.logger.Trace().Msg("Stopping scheduler")
 
-	if s.cancelCtx != nil {
-		s.cancelCtx()
+	if r := s.run.Load(); r != nil {
+		r.cancel()
 	}
 
 	// mainLoop stops all timers on exit; once it is done nothing adds to wg any more.
@@ -779,13 +888,22 @@ func (s *internalScheduler) Stop() error {
 	return nil
 }
 
-func (s *internalScheduler) ScheduledTasks() []Task {
-	tasks := make([]Task, 0)
+func (s *internalScheduler) ScheduledTasks() []TaskInfo {
+	infos := make([]TaskInfo, 0)
 	s.tasks.Range(func(key, value interface{}) bool {
-		tasks = append(tasks, value.(*schedulingUnit).task)
+		infos = append(infos, *value.(*schedulingUnit).info.Load())
 		return true
 	})
-	return tasks
+	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	return infos
+}
+
+func (s *internalScheduler) Task(id string) (TaskInfo, bool) {
+	value, ok := s.tasks.Load(id)
+	if !ok {
+		return TaskInfo{}, false
+	}
+	return *value.(*schedulingUnit).info.Load(), true
 }
 
 func (s *internalScheduler) RemoveTask(id string) error {
@@ -800,8 +918,8 @@ func (s *internalScheduler) RemoveTask(id string) error {
 	// The unit's timer, if still pending, fires once and is dropped by the main loop.
 
 	callbackCtx := context.Background()
-	if s.schedulerCtx != nil {
-		callbackCtx = s.schedulerCtx
+	if c := s.currentCtx(); c != nil {
+		callbackCtx = c
 	}
 	if su.onRemoved != nil {
 		s.logger.Trace().Str("task", id).Msg("Calling removed callback for removed task")

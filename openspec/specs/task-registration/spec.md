@@ -79,11 +79,11 @@ The scheduler SHALL remove a task by ID, stop its pending timer and invoke its r
 - **THEN** its skip callback is not called
 
 ### Requirement: Listing tasks
-The scheduler SHALL return the task functions of all registered tasks.
+The scheduler SHALL return a snapshot of every registered task, ordered by task ID.
 
 #### Scenario: List registered tasks
 - **WHEN** two tasks are registered and ScheduledTasks is called
-- **THEN** two task functions are returned
+- **THEN** two task snapshots are returned, carrying the IDs of the two tasks in ascending order
 
 ### Requirement: Registration validation
 RegisterTask SHALL reject, with a non-nil error and without storing or scheduling anything, a nil task, a nil schedule, an interval schedule with a non-positive interval, a negative MaxDrift, a NotAfter that is not after NotBefore, backfill without NotBefore, and a nil callback function. The error SHALL match an exported sentinel error via errors.Is, and all detected problems SHALL be reported together.
