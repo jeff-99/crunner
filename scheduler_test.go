@@ -52,7 +52,7 @@ func TestSchedulingSimpleTask(t *testing.T) {
 
 		tickXSeconds(5 * time.Second)
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(5), count.Load())
 
@@ -122,7 +122,7 @@ func TestSchedulingTaskEveryXSeconds(t *testing.T) {
 
 				tickXSeconds(time.Duration(numberOfIntervals) * interval)
 
-				scheduler.Stop()
+				scheduler.Stop(context.Background())
 
 				expectedCount := int32(test.expectedRuns)
 				assert.Equal(t, expectedCount, count.Load())
@@ -180,7 +180,7 @@ func TestSchedulingTaskAfterXIntervalsOfRunning(t *testing.T) {
 		assert.Equal(t, int32(7), intervalScheduleCount.Load())
 		assert.Equal(t, int32(7), cronScheduleCount.Load())
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 
@@ -212,7 +212,7 @@ func TestRemovingTaskStopsExecution(t *testing.T) {
 
 		tickXSeconds(2 * time.Second)
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(2), count.Load())
 
@@ -243,7 +243,7 @@ func TestStoppingAndStartingScheduler(t *testing.T) {
 		tickXSeconds(2 * time.Second)
 		assert.Equal(t, int32(2), count.Load())
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		tickXSeconds(2 * time.Second)
 
@@ -255,7 +255,7 @@ func TestStoppingAndStartingScheduler(t *testing.T) {
 		// MaxDrift, so both run on restart, followed by [4s,5s) and [5s,6s): 2 + 4 = 6 runs.
 		assert.Equal(t, int32(6), count.Load())
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 
@@ -293,7 +293,7 @@ func TestSchedulerSuccessCallback(t *testing.T) {
 		assert.Equal(t, int32(2), count.Load())
 		assert.Equal(t, int32(1), succesfulExecution.Load())
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 
@@ -332,7 +332,7 @@ func TestSchedulerErrorCallback(t *testing.T) {
 		assert.Equal(t, int32(2), count.Load())
 		assert.Equal(t, int32(1), erroredExecutions.Load())
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 
@@ -397,7 +397,7 @@ func TestTriggerMetadataInTask(t *testing.T) {
 		assert.Equal(t, schedulingStart.Add(2*time.Second), triggerWindowStart)
 		assert.Equal(t, schedulingStart.Add(4*time.Second), triggerWindowEnd)
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 }
@@ -432,7 +432,7 @@ func TestTaskWithBackfill(t *testing.T) {
 
 		assert.Equal(t, 10, int(counter.Load()))
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 	})
 }
@@ -494,7 +494,7 @@ func TestTaskTriggerWindows(t *testing.T) {
 				tickXSeconds(time.Duration(numberOfIntervals) * interval)
 
 				// Stop waits for running tasks, so reading windows afterwards is race-free.
-				scheduler.Stop()
+				scheduler.Stop(context.Background())
 
 				if interval%time.Second == 0 {
 					// interval task always start immediately, so we should have one more window than the number of intervals
@@ -586,7 +586,7 @@ func TestTaskTriggerWindowsWithBackfill(t *testing.T) {
 				tickXSeconds(time.Duration(numberOfIntervals) * interval)
 
 				// Stop waits for running tasks, so reading windows afterwards is race-free.
-				scheduler.Stop()
+				scheduler.Stop(context.Background())
 
 				// with backfill enabled and a start time before the epoch, so we can calculate the number of backfill jobs and add them to the number of intervals
 				// backfills := int(startTimeDelta / interval)
@@ -640,7 +640,7 @@ func TestScheduleNextError(t *testing.T) {
 		runtime.Gosched() // Yield to increase chance of main loop running
 		time.Sleep(100 * time.Millisecond)
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		// Assert that the task never ran because scheduling failed
 		assert.Equal(t, int32(0), runCount.Load(), "Task should not run if schedule.Next errors")
@@ -710,7 +710,7 @@ func TestRegisterTaskOverwrite(t *testing.T) {
 		assert.Equal(t, int32(1), count1.Load(), "Task 1 count should still remain 1")
 		assert.Equal(t, int32(2), count2.Load(), "Task 2 should run a second time")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -753,7 +753,7 @@ func TestRemoveTaskRepeatedly(t *testing.T) {
 		assert.Error(t, err, "Second RemoveTask for the same ID should fail")
 		assert.Contains(t, err.Error(), fmt.Sprintf("task with id %s not found", taskID), "Error message should indicate task not found")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -805,7 +805,7 @@ func TestRemoveTaskRemovedCallback(t *testing.T) {
 		tickXSeconds(1 * time.Second)
 		assert.Equal(t, int32(1), taskRunCount.Load(), "Task should not run after removal")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -876,7 +876,7 @@ func TestOverwriteTaskRemovedCallback(t *testing.T) {
 		assert.Equal(t, task2RunCount.Load(), int32(1), "Task 2 should run again") // Should be at least 2 now
 		assert.Equal(t, int32(1), cancel1CallbackCount.Load(), "Cancel callback 1 count should remain 1")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -932,7 +932,7 @@ func TestMassDriftSkipDoesNotStallScheduler(t *testing.T) {
 		}
 		assert.Equal(t, int32(5), canaryRuns.Load(), "canary task should keep running")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -969,7 +969,7 @@ func TestBlockingDriftSkipCallbackDoesNotBlockOtherTasks(t *testing.T) {
 
 		stopped := make(chan struct{})
 		go func() {
-			scheduler.Stop()
+			scheduler.Stop(context.Background())
 			close(stopped)
 		}()
 		synctest.Wait()
@@ -1020,7 +1020,7 @@ func TestStressConcurrentRegisterReplaceRemoveStop(t *testing.T) {
 	}
 	wg.Wait()
 
-	assert.NoError(t, scheduler.Stop())
+	assert.NoError(t, scheduler.Stop(context.Background()))
 	assert.Positive(t, stableRuns.Load(), "an untouched task should keep running during the churn")
 }
 
@@ -1061,7 +1061,7 @@ func TestSupersededTaskPendingTimerDoesNotRun(t *testing.T) {
 				tickXSeconds(10 * time.Second)
 				assert.Equal(t, int32(0), oldRuns.Load(), "old task must not run after its pending timer fires")
 
-				scheduler.Stop()
+				scheduler.Stop(context.Background())
 			})
 		})
 	}
@@ -1107,7 +1107,7 @@ func TestConcurrentRegistrationsSameIDRemoveDisplacedExactlyOnce(t *testing.T) {
 		assert.Equal(t, int32(1), runs.Load(), "exactly one registration remains and runs")
 		assert.Len(t, scheduler.ScheduledTasks(), 1)
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -1146,7 +1146,7 @@ func TestConcurrentRemoveSameIDSucceedsOnce(t *testing.T) {
 		assert.Equal(t, int32(1), successes.Load(), "exactly one RemoveTask succeeds")
 		assert.Equal(t, int32(1), cancelled.Load(), "cancel callback fires exactly once")
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -1184,7 +1184,7 @@ func TestPanickingTaskIsReportedAsError(t *testing.T) {
 		))
 
 		tickXSeconds(1 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -1217,7 +1217,7 @@ func TestPanickingTaskKeepsRunningAndDoesNotAffectOthers(t *testing.T) {
 		))
 
 		tickXSeconds(5 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(5), panics.Load(), "panicking task is rescheduled on every window")
 		assert.Equal(t, int32(5), errorCallbacks.Load())
@@ -1245,7 +1245,7 @@ func TestPanicWithErrorValueUnwraps(t *testing.T) {
 		))
 
 		tickXSeconds(1 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -1343,7 +1343,7 @@ func TestRejectedRegistrationLeavesExistingTaskIntact(t *testing.T) {
 		assert.ErrorIs(t, err, s.ErrInvalidSchedule)
 
 		tickXSeconds(3 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(3), runs.Load(), "original task keeps running on its schedule")
 		assert.Equal(t, int32(0), cancels.Load(), "original task is not cancelled")
@@ -1392,7 +1392,7 @@ func TestFirstWindowOfTaskRegisteredBeforeStartBeginsAtStart(t *testing.T) {
 		assert.NoError(t, scheduler.Start(t.Context()))
 		time.Sleep(10*time.Second + time.Millisecond)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		if assert.Len(t, runs, 1) {
@@ -1418,7 +1418,7 @@ func TestWindowsStayOnGridWhenRunsStartLate(t *testing.T) {
 
 		time.Sleep(100*12*time.Second + 20*time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		if assert.GreaterOrEqual(t, len(runs), 100) {
@@ -1460,7 +1460,7 @@ func TestScheduleReferenceTimeIsPreviousWindowEnd(t *testing.T) {
 
 		time.Sleep(60 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		sch.mu.Lock()
@@ -1494,7 +1494,7 @@ func TestOverrunBeyondMaxDriftIsSkippedAndMerged(t *testing.T) {
 
 		time.Sleep(41 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		mu.Lock()
@@ -1546,7 +1546,7 @@ func TestLateRunIsCancelledAndMergedIntoNextWindow(t *testing.T) {
 
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		if assert.Len(t, runs, 2) {
@@ -1572,7 +1572,7 @@ func TestRestartAfterLongStopMergesMissedWindows(t *testing.T) {
 			s.WithSkipCallback(func(context.Context, s.TriggerMetadata) { cancels.Add(1) })))
 
 		time.Sleep(15 * time.Second)
-		assert.NoError(t, scheduler.Stop())
+		assert.NoError(t, scheduler.Stop(context.Background()))
 		time.Sleep(68 * time.Second) // now 83s
 		assert.NoError(t, scheduler.Start(t.Context()))
 		synctest.Wait()
@@ -1582,7 +1582,7 @@ func TestRestartAfterLongStopMergesMissedWindows(t *testing.T) {
 
 		time.Sleep(17*time.Second + time.Millisecond) // now 100s
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		runs := rec.get()
 		if assert.Len(t, runs, 3) {
@@ -1642,7 +1642,7 @@ func TestTaskTimeouts(t *testing.T) {
 				assert.NoError(t, scheduler.RegisterTask(deadlineRecorder(&mu, &deadlines, false), s.WithIntervalSchedule(time.Second), opts...))
 
 				tickXSeconds(time.Second)
-				scheduler.Stop()
+				scheduler.Stop(context.Background())
 
 				mu.Lock()
 				defer mu.Unlock()
@@ -1690,7 +1690,7 @@ func TestTaskTimeoutCancelsRun(t *testing.T) {
 
 		time.Sleep(7 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -1731,7 +1731,7 @@ func TestScheduleTimeouts(t *testing.T) {
 			assert.NoError(t, scheduler.Start(t.Context()))
 			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil }, sch, s.WithID("t")))
 			synctest.Wait()
-			scheduler.Stop()
+			scheduler.Stop(context.Background())
 
 			sch.mu.Lock()
 			defer sch.mu.Unlock()
@@ -1753,7 +1753,7 @@ func TestScheduleTimeouts(t *testing.T) {
 				s.WithIntervalSchedule(time.Second), s.WithID("canary")))
 
 			tickXSeconds(10 * time.Second)
-			scheduler.Stop()
+			scheduler.Stop(context.Background())
 
 			sch.mu.Lock()
 			defer sch.mu.Unlock()
@@ -1771,7 +1771,7 @@ func TestScheduleTimeouts(t *testing.T) {
 			assert.NoError(t, scheduler.Start(t.Context()))
 			assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { return nil }, sch, s.WithID("t")))
 			synctest.Wait()
-			scheduler.Stop()
+			scheduler.Stop(context.Background())
 
 			sch.mu.Lock()
 			defer sch.mu.Unlock()
@@ -1792,7 +1792,7 @@ func TestEmptyIDTaskRuns(t *testing.T) {
 			s.WithIntervalSchedule(time.Second), s.WithID("")))
 
 		tickXSeconds(3 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(3), runs.Load())
 		assert.Len(t, scheduler.ScheduledTasks(), 1)
@@ -1809,7 +1809,7 @@ func TestTasksWithoutIDDoNotReplaceEachOther(t *testing.T) {
 		assert.NoError(t, scheduler.RegisterTask(func(context.Context, s.TriggerMetadata) error { b.Add(1); return nil }, s.WithIntervalSchedule(time.Second)))
 
 		tickXSeconds(3 * time.Second)
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(3), a.Load())
 		assert.Equal(t, int32(3), b.Load())
@@ -1842,7 +1842,7 @@ func TestSkipCallbackReceivesSkippedRunMetadata(t *testing.T) {
 
 		time.Sleep(29 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -1878,7 +1878,7 @@ func TestRemovingOrReplacingTaskDoesNotCallSkipCallback(t *testing.T) {
 		assert.NoError(t, register("replaced")) // replaces
 		assert.NoError(t, scheduler.RemoveTask("removed"))
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		assert.Equal(t, int32(2), removed.Load(), "replacement and removal each call the removed callback once")
 		assert.Equal(t, int32(0), skips.Load(), "replacement and removal must not call the skip callback")
@@ -1921,7 +1921,7 @@ func TestDriftIsMeasuredFromWindowEnd(t *testing.T) {
 
 		time.Sleep(61 * time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -1992,7 +1992,7 @@ func TestTaskInspectionLifecycle(t *testing.T) {
 		assert.Equal(t, 10*time.Second, rel(info.WindowStart))
 		assert.Equal(t, 20*time.Second, rel(info.WindowEnd))
 
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 		info, _ = scheduler.Task("job")
 		assert.True(t, info.NextRunTime.IsZero(), "nothing pending after Stop")
 		assert.False(t, info.Running)
@@ -2029,7 +2029,7 @@ func TestTaskInspectionErroredRun(t *testing.T) {
 		assert.Equal(t, boom, info.LastError)
 		assert.Equal(t, 10*time.Second, info.LastErroredRunTime.Sub(origin))
 		assert.True(t, info.LastSuccessfulRunTime.IsZero())
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -2046,7 +2046,7 @@ func TestTaskInspectionScheduleError(t *testing.T) {
 		info, ok := scheduler.Task("broken")
 		assert.True(t, ok)
 		assert.True(t, info.NextRunTime.IsZero(), "a task whose schedule fails has no next run")
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -2097,7 +2097,7 @@ func TestTaskInfoSnapshotIsIsolated(t *testing.T) {
 		second, _ := scheduler.Task("job")
 		assert.Equal(t, 2, second.Count)
 		assert.Equal(t, 99, first.Count, "an earlier snapshot is unchanged by later runs")
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 	})
 }
 
@@ -2131,7 +2131,7 @@ func TestTaskInspectionIsRaceFreeDuringStartStopAndRuns(t *testing.T) {
 	for range 5 {
 		assert.NoError(t, scheduler.Start(t.Context()))
 		time.Sleep(30 * time.Millisecond)
-		assert.NoError(t, scheduler.Stop())
+		assert.NoError(t, scheduler.Stop(context.Background()))
 	}
 	close(stop)
 	wg.Wait()
@@ -2155,7 +2155,7 @@ func TestStartStopRegisterRemoveAreRaceFree(t *testing.T) {
 				}
 				_ = scheduler.Start(context.Background())
 				time.Sleep(time.Duration(g+1) * time.Millisecond)
-				_ = scheduler.Stop()
+				_ = scheduler.Stop(context.Background())
 			}
 		}()
 	}
@@ -2180,5 +2180,5 @@ func TestStartStopRegisterRemoveAreRaceFree(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
-	assert.NoError(t, scheduler.Stop())
+	assert.NoError(t, scheduler.Stop(context.Background()))
 }
