@@ -17,7 +17,7 @@
 
 **Goals:**
 - Same accepted language and same next times as today for every expression crunner accepts today, apart from the three tightenings listed in the proposal.
-- Standard library only; small enough to review (~300 lines).
+- Standard library only; small enough to review. robfig's `parser.go` (~330 code lines) and `spec.go` (~130 code lines) are the only parts replaced, so the port is roughly 450 lines plus tests; `@every`, the cron runner and the options in robfig are unused or already covered by `Every`.
 
 **Non-Goals:**
 - Extensions (`L`, `W`, `#`, `H`, year field, `7` for Sunday, upper-case descriptors).
@@ -35,10 +35,17 @@
 
 **Location precedence.** Unchanged: prefix zone, else the zone of the time passed to `Next` (which `cronSchedule` sets from its location argument). Keeping the sentinel semantics internal avoids touching `fix-cron-time-zone-handling`'s territory.
 
+**Opt-in DST-safe mode.** Default matching stays robfig-compatible (gap skipped, overlap fires twice). A cron option enables the safe mode: a non-existent wall time fires after the gap, a repeated wall time fires only at its first occurrence. Opt-in keeps the "same next times" promise above intact. Because the new `Next` already walks calendar days in the evaluation zone, the mode is a branch in the day/hour step instead of a wrapper around a foreign parser.
+
+Comparison with gocron v2: gocron v2 wraps robfig's `SpecSchedule`. Its `WithDaylightSavingsTimePolicy` offers `Default`, `Skip` and `RunAfterTransition`, which only concern the spring-forward gap. For cron the gap default is to skip the day; `RunAfterTransition` scans the intermediate days after the fact and only works with the built-in parser. For the fall-back overlap gocron's `cronJob.next` always skips the second occurrence when the wall-clock time equals the last run. We take the same outcomes (run-after-transition and first-occurrence-only) but offer them as one switch and implement them inside the parser. Alternative: a three-valued policy like gocron's. Rejected for now: `Skip` equals the default, so a boolean-style option carries the same information. A policy type can replace it later without breaking callers if a use case appears.
+
+Fixed-time versus wildcard expressions: only expressions that fix both hour and minute of a time inside the affected hour are adjusted. Wildcard and step fields keep the default behaviour so `*/10 * * * *` keeps firing on the new clock.
+
 ## Risks / Trade-offs
 
 - [Subtle divergence from robfig on an untested input] → differential test across generated expressions and DST zones before the dependency is dropped.
 - [Users depending on `cron.Schedule` type] → called out as BREAKING in the proposal; the method set is identical.
+- [DST-safe mode has no reference implementation to diff against] → pin it with golden tests around the 2026 Europe/Amsterdam and America/New_York transitions and the Sao Paulo midnight gap, plus a property test that it never yields two results for one wall-clock time and never yields a time before the reference.
 - [Tightening `,` to an error breaks a config that "worked"] → it never fired; an error is strictly more useful.
 
 ## Migration Plan

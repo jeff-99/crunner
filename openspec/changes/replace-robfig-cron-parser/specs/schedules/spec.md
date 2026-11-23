@@ -135,7 +135,7 @@ An expression or descriptor MAY be prefixed with `TZ=<name>` or `CRON_TZ=<name>`
 - **THEN** an error is returned
 
 ### Requirement: Cron daylight-saving behaviour
-Matching SHALL use wall-clock time in the evaluation zone. A wall-clock time that does not exist on a day because of a forward DST transition SHALL NOT fire that day; a wall-clock time that occurs twice because of a backward transition SHALL fire at both occurrences.
+By default, matching SHALL use wall-clock time in the evaluation zone. A wall-clock time that does not exist on a day because of a forward DST transition SHALL NOT fire that day; a wall-clock time that occurs twice because of a backward transition SHALL fire at both occurrences.
 
 #### Scenario: Spring forward
 - **WHEN** `30 2 * * *` is evaluated in Europe/Amsterdam across 29 March 2026
@@ -144,6 +144,29 @@ Matching SHALL use wall-clock time in the evaluation zone. A wall-clock time tha
 #### Scenario: Fall back
 - **WHEN** `30 2 * * *` is evaluated in Europe/Amsterdam on 25 October 2026
 - **THEN** it fires at 02:30 CEST and again at 02:30 CET
+
+### Requirement: DST-safe cron option
+The cron schedule SHALL offer an opt-in DST-safe mode. In this mode a wall-clock time that does not exist on a day because of a forward DST transition SHALL fire once on that day at the equivalent instant after the gap, and a wall-clock time that occurs twice because of a backward transition SHALL fire only at its first occurrence. Expressions whose fields do not fix a time inside the affected hour (wildcards and steps over hours or minutes) SHALL behave as in the default mode.
+
+#### Scenario: Gap runs after the transition
+- **WHEN** a DST-safe `30 2 * * *` is evaluated in Europe/Amsterdam across 29 March 2026
+- **THEN** it fires on 28 March at 02:30, on 29 March at 03:30 CEST, and on 30 March at 02:30
+
+#### Scenario: Overlap fires once
+- **WHEN** a DST-safe `30 2 * * *` is evaluated in Europe/Amsterdam on 25 October 2026
+- **THEN** it fires once, at 02:30 CEST, and the next run is 26 October at 02:30 CET
+
+#### Scenario: Gap at local midnight
+- **WHEN** a DST-safe `30 0 * * *` is evaluated in America/Sao_Paulo on a day whose midnight does not exist
+- **THEN** it fires once that day at the equivalent instant after the gap, not on the previous calendar day
+
+#### Scenario: Wildcards unaffected
+- **WHEN** a DST-safe `*/10 * * * *` is evaluated across a transition
+- **THEN** it fires at the same instants as without the option
+
+#### Scenario: Default unchanged
+- **WHEN** the option is not given
+- **THEN** the default scenarios of "Cron daylight-saving behaviour" apply
 
 ### Requirement: Cron search limit
 When an expression has no matching time within five years of the reference time, computing the next run of a cron schedule SHALL return an error.

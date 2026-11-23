@@ -12,12 +12,19 @@
 - [ ] 2.2 Verify DST behaviour with tests for "Cron daylight-saving behaviour" (Europe/Amsterdam spring forward and fall back 2026) and a Sao Paulo historic midnight-skip case
 - [ ] 2.3 Add a temporary differential test comparing `Next` against robfig/cron v3 for the spec table plus generated expressions and reference times across DST zones; verify it passes with `go test ./...`
 
-## 3. Switch over
+## 3. DST-safe mode
 
-- [ ] 3.1 Export `CronExpression`, make `ParseCron` return it, and make `cronSchedule` use the new parser; verify existing `schedule_test.go` and `scheduler_test.go` pass unchanged
-- [ ] 3.2 Make `cronSchedule.Next` return an error when no next time exists; verify with a synctest scheduler test that a task with `0 0 30 2 *` is not scheduled and the error is logged
-- [ ] 3.3 Convert the differential test's results into golden expectations, delete the comparison test, run `go mod tidy`, and verify `go.mod` no longer lists `github.com/robfig/cron/v3` and `go test -race ./...` passes
+- [ ] 3.1 Add the DST-safe cron option (a `CronOption`, introduced by `tidy-public-api`) and thread it into the next-time search; verify the default scenarios of "Cron daylight-saving behaviour" still pass unchanged
+- [ ] 3.2 Implement the gap rule (fire at the equivalent instant after the gap, including gaps at local midnight) and the overlap rule (first occurrence only) for fixed hour and minute fields; verify with tests for "DST-safe cron option" in Europe/Amsterdam and America/New_York 2026 and the Sao Paulo midnight gap
+- [ ] 3.3 Add a property test for the DST-safe mode: results are strictly increasing, never earlier than the reference, and never two results for one wall-clock time on a day; verify it passes over a generated expression set across DST zones
+- [ ] 3.4 Verify wildcard and step expressions give identical results with and without the option; verify with a test over `*/10 * * * *` and `0 * * * *` across both transitions
 
-## 4. Docs
+## 4. Switch over
 
-- [ ] 4.1 Document the accepted cron syntax, descriptors, time-zone prefix and DST behaviour in the `ParseCron`/`WithCronSchedule` godoc and README, and note the BREAKING return-type change in the changelog; verify `go doc` renders it
+- [ ] 4.1 Export `CronExpression`, make `ParseCron` return it, and make `cronSchedule` use the new parser; verify existing `schedule_test.go` and `scheduler_test.go` pass unchanged
+- [ ] 4.2 Make `cronSchedule.Next` return an error when no next time exists; verify with a synctest scheduler test that a task with `0 0 30 2 *` is not scheduled and the error is logged
+- [ ] 4.3 Convert the differential test's results into golden expectations, delete the comparison test, run `go mod tidy`, and verify `go.mod` no longer lists `github.com/robfig/cron/v3` and `go test -race ./...` passes
+
+## 5. Docs
+
+- [ ] 5.1 Document the accepted cron syntax, descriptors, time-zone prefix, default DST behaviour and the DST-safe option in the `ParseCron`/`WithCronSchedule` godoc and README, and note the BREAKING return-type change in the changelog; verify `go doc` renders it
