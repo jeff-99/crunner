@@ -126,7 +126,7 @@ func TestCronTaskFirstTriggerWindowHonoursLocation(t *testing.T) {
 
 		time.Sleep(14*time.Hour + time.Second)
 		synctest.Wait()
-		scheduler.Stop()
+		scheduler.Stop(context.Background())
 
 		mu.Lock()
 		defer mu.Unlock()

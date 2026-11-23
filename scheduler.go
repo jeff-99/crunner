@@ -184,7 +184,11 @@ type Scheduler interface {
 	// Task returns a snapshot of the task with the given ID, and false when it is not registered.
 	Task(id string) (TaskInfo, bool)
 	Start(ctx context.Context) error
-	Stop() error
+	// Stop cancels the scheduler and waits for running tasks until they return or ctx is done. When ctx
+	// ends first, Stop returns an error wrapping ctx.Err(); the tasks that are still running are abandoned
+	// and the scheduler only becomes idle (and startable again) once they have returned. Pass
+	// context.Background() to wait without a bound.
+	Stop(ctx context.Context) error
 }
 
 // TriggerMetadata describes a run. Its trigger window [TriggerWindowStart, TriggerWindowEnd) is
@@ -240,6 +244,9 @@ type internalScheduler struct {
 
 	// closed by mainLoop on exit; Stop waits on it before waiting for running tasks
 	loopDone chan struct{}
+	// drained is closed once every task of the last run has returned and the scheduler is idle again;
+	// guarded by lifecycleMu. A Stop that finds the scheduler stopping waits on it.
+	drained chan struct{}
 
 	summaryInterval time.Duration
 	taskTimeout     time.Duration
@@ -857,18 +864,46 @@ func (s *internalScheduler) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s *internalScheduler) Stop() error {
+func (s *internalScheduler) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	drained, err := s.beginStop()
+	if err != nil || drained == nil {
+		return err
+	}
+
+	// The wait happens outside lifecycleMu so that Start and further Stop calls can observe the
+	// stopping state instead of blocking on a slow shutdown.
+	select {
+	case <-drained:
+		s.logger.Trace().Msg("Scheduler stopped")
+		return nil
+	case <-ctx.Done():
+		s.logger.Warn().Msg("Stop gave up waiting for running tasks")
+		return fmt.Errorf("crunner: stop: %w", ctx.Err())
+	}
+}
+
+// beginStop moves a running scheduler to stopping and starts draining it. It returns the channel that
+// closes once the scheduler is idle, or nil when there is nothing to wait for.
+func (s *internalScheduler) beginStop() (<-chan struct{}, error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
 	if !s.state.CompareAndSwap(stateRunning, stateStopping) {
-		currentState := s.state.Load()
-		if currentState == stateIdle || currentState == stateStopping {
-			s.logger.Trace().Int32("state", currentState).Msg("Scheduler already stopped or stopping")
-			return nil
+		switch currentState := s.state.Load(); currentState {
+		case stateIdle:
+			s.logger.Trace().Msg("Scheduler already stopped")
+			return nil, nil
+		case stateStopping:
+			s.logger.Trace().Msg("Scheduler already stopping, waiting for it to drain")
+			return s.drained, nil
+		default:
+			s.logger.Warn().Int32("state", currentState).Msg("Scheduler cannot stop from current state")
+			return nil, fmt.Errorf("scheduler cannot stop from state %d", currentState)
 		}
-		s.logger.Warn().Int32("state", currentState).Msg("Scheduler cannot stop from current state")
-		return fmt.Errorf("scheduler cannot stop from state %d", currentState)
 	}
 
 	s.logger.Trace().Msg("Stopping scheduler")
@@ -880,12 +915,16 @@ func (s *internalScheduler) Stop() error {
 	// mainLoop stops all timers on exit; once it is done nothing adds to wg any more.
 	<-s.loopDone
 
-	s.wg.Wait()
+	drained := make(chan struct{})
+	s.drained = drained
+	go func() {
+		s.wg.Wait()
+		// Idle is published before drained closes so a caller released by drained can Start at once.
+		s.state.Store(stateIdle)
+		close(drained)
+	}()
 
-	s.state.Store(stateIdle)
-	s.logger.Trace().Msg("Scheduler stopped")
-
-	return nil
+	return drained, nil
 }
 
 func (s *internalScheduler) ScheduledTasks() []TaskInfo {
